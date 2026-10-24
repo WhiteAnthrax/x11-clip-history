@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""クリップボード履歴(テキストと画像)を、xrdp に優しいやり方で記録・呼び出すツール。
+
+  clip-history [daemon]   常駐してクリップボードの変化を記録する
+  clip-history pick       履歴を一覧表示し、選んだものをクリップボードに戻す (Super+V 用)
+
+xrdp-chansrv は応答待ちの要求を 1 件しか保持できず、要求が重なると片方が応答されない。
+そのため、所有者が変わるたびに TARGETS を確認し、実際に提供されている形式を 1 回だけ要求する。
+(clipman は画像で png/jpeg/gif/bmp を順に、CopyQ は同じ形式を 5 回要求していた)
+画像は PNG ファイル、テキストは JSON(mode 600)に保存する。
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
+
+# 優先順。Linux アプリは png を出すことが多く、chansrv は bmp のみ
+IMAGE_TARGETS = ["image/png", "image/bmp", "image/jpeg", "image/tiff"]
+TEXT_TARGETS = ["UTF8_STRING", "text/plain;charset=utf-8", "STRING"]
+
+DEBUG = False
+
+
+def debug(msg):
+    if DEBUG:
+        log(msg)
+
+
+def log(msg):
+    print(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+def default_image_dir():
+    pictures = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES)
+    return Path(pictures or Path.home() / "Pictures") / "clipboard"
+
+
+def default_text_file():
+    return Path(GLib.get_user_data_dir()) / "clip-history" / "texts.json"
+
+
+def load_texts(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return []
+
+
+def write_private(path, data):
+    """他ユーザーから読めない権限で原子的に書き込む"""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    tmp.rename(path)
+
+
+class Recorder:
+    # 応答が来ないまま待ち続けないための上限
+    REQUEST_TIMEOUT_MS = 30000
+
+    def __init__(self, args):
+        self.image_dir = args.image_dir
+        self.text_file = args.text_file
+        self.keep_images = args.keep_images
+        self.keep_texts = args.keep_texts
+        self.delay_ms = args.delay_ms
+        self.max_image = args.max_image_mb * 1024 * 1024
+        self.max_text = args.max_text_kb * 1024
+        self.clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self.timer = 0
+        self.watchdog = 0
+        self.req = 0  # 現在の要求の番号。古い要求への遅れた応答を無視するため
+        self.busy = False
+        self.pending = False
+        self.clipboard.connect("owner-change", self.on_owner_change)
+
+    def on_owner_change(self, _clipboard, event):
+        debug(f"owner-change reason={event.reason}")
+        # 連続した所有者変更はまとめて 1 回だけ処理する
+        if self.timer:
+            GLib.source_remove(self.timer)
+        self.timer = GLib.timeout_add(self.delay_ms, self.check)
+
+    def check(self):
+        self.timer = 0
+        if self.busy:
+            # 前の要求の応答待ち中は重ねて要求しない
+            self.pending = True
+            return False
+        self.busy = True
+        self.req += 1
+        self.watchdog = GLib.timeout_add(self.REQUEST_TIMEOUT_MS, self.on_timeout, self.req)
+        self.clipboard.request_targets(self.on_targets, self.req)
+        return False
+
+    def on_timeout(self, req):
+        self.watchdog = 0
+        log(f"要求 {req} の応答がありません。待ちを解除します")
+        self.finish(req)
+        return False
+
+    def finish(self, req):
+        if req != self.req or not self.busy:
+            return
+        if self.watchdog:
+            GLib.source_remove(self.watchdog)
+            self.watchdog = 0
+        self.busy = False
+        if self.pending:
+            self.pending = False
+            self.check()
+
+    def on_targets(self, _clipboard, atoms, _n, req):
+        if req != self.req:
+            return
+        names = [a.name() for a in (atoms or [])]
+        debug(f"targets={names}")
+        # 画像とテキストの両方があれば画像を優先する(ブラウザの画像コピーなど)
+        target = next((t for t in IMAGE_TARGETS + TEXT_TARGETS if t in names), None)
+        if target is None:
+            self.finish(req)
+            return
+        self.clipboard.request_contents(
+            Gdk.Atom.intern(target, False), self.on_contents, (req, target)
+        )
+
+    def on_contents(self, _clipboard, selection, user_data):
+        req, target = user_data
+        if req != self.req:
+            return
+        try:
+            # 失敗した応答は length < 0。この状態で get_data を呼ぶと GLib が警告を出す
+            length = selection.get_length() if selection else -1
+            debug(f"{target}: length={length}")
+            limit = self.max_image if target.startswith("image/") else self.max_text
+            if length <= 0:
+                log(f"{target}: データを取得できませんでした (length={length})")
+            elif length > limit:
+                log(f"{target}: {length} bytes は上限超過のため保存しません")
+            elif target.startswith("image/"):
+                self.save_image(selection.get_data(), target)
+            else:
+                self.save_text(selection.get_data(), target)
+        except Exception as e:  # 常駐を止めないため、失敗はログだけ残す
+            log(f"{target}: 保存に失敗しました: {e}")
+        self.finish(req)
+
+    def save_text(self, data, target):
+        enc = "latin-1" if target == "STRING" else "utf-8"
+        text = data.decode(enc, errors="replace")
+        if not text.strip():
+            return
+        texts = [t for t in load_texts(self.text_file) if t["text"] != text]
+        texts.insert(0, {"time": int(time.time()), "text": text})
+        del texts[self.keep_texts:]
+        write_private(self.text_file, json.dumps(texts, ensure_ascii=False).encode("utf-8"))
+        debug(f"テキストを記録 ({len(text)} 文字)")
+
+    def save_image(self, data, target):
+        self.image_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(data).hexdigest()[:12]
+        if any(self.image_dir.glob(f"*-{digest}.png")):
+            return
+        if target == "image/png" and self.same_png_exists(data):
+            # pick で戻した画像が再び記録されるのを防ぐ
+            return
+        path = self.image_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{digest}.png"
+        tmp = path.with_suffix(".tmp")
+        if target == "image/png":
+            tmp.write_bytes(data)
+        else:
+            loader = GdkPixbuf.PixbufLoader()
+            loader.write(data)
+            loader.close()
+            loader.get_pixbuf().savev(str(tmp), "png", [], [])
+        tmp.rename(path)
+        log(f"画像を保存: {path} ({target}, {len(data)} bytes)")
+        files = sorted(self.image_dir.glob("*.png"))
+        for old in files[: max(0, len(files) - self.keep_images)]:
+            old.unlink(missing_ok=True)
+
+    def same_png_exists(self, data):
+        for f in self.image_dir.glob("*.png"):
+            if f.stat().st_size == len(data) and f.read_bytes() == data:
+                return True
+        return False
+
+
+def lock_path(name):
+    """ディスプレイごとの lock ファイルのパス"""
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+    display = os.environ.get("DISPLAY", "").replace(":", "").replace("/", "_")
+    return runtime / f"{name}.{display}.lock"
+
+
+def run_daemon(args):
+    if not os.environ.get("DISPLAY"):
+        sys.exit("DISPLAY が未設定です")
+    # 同じディスプレイで二重起動しない
+    lock = open(lock_path("clip-history"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("既に起動しています")
+    Recorder(args)
+    log(f"監視開始: DISPLAY={os.environ['DISPLAY']} 画像={args.image_dir} テキスト={args.text_file}")
+    Gtk.main()
+
+
+def is_japanese():
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(var)
+        if value:
+            return value.startswith("ja")
+    return False
+
+
+# pick の画面に出す文言。日本語環境以外では英語にする
+MESSAGES = {
+    True: {
+        "empty": "クリップボード履歴はまだありません",
+        "title": "クリップボード履歴",
+        "text": "選んだものをクリップボードに戻します (もう一度 Super+V で閉じます)",
+        "columns": ["日時", "種類", "内容"],
+        "kind_text": "テキスト",
+        "kind_image": "[画像]",
+    },
+    False: {
+        "empty": "Clipboard history is empty",
+        "title": "Clipboard history",
+        "text": "The selected item is copied back to the clipboard (press Super+V again to close)",
+        "columns": ["Time", "Type", "Content"],
+        "kind_text": "Text",
+        "kind_image": "[Image]",
+    },
+}
+
+
+def preview(text, width=100):
+    one = " ⏎ ".join(line.strip() for line in text.strip().splitlines())
+    return one if len(one) <= width else one[: width - 1] + "…"
+
+
+def run_pick(args):
+    # 一覧は 1 つだけ。既に開いていれば、それを閉じて終わる(Super+V でトグル)
+    lock = open(lock_path("clip-history-pick"), "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.seek(0)
+        pid = lock.read().strip()
+        if pid.isdigit():
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        return
+    lock.seek(0)
+    lock.truncate()
+
+    msg = MESSAGES[is_japanese()]
+    entries = []  # (時刻, 種類, 表示, 値)
+    for t in load_texts(args.text_file):
+        entries.append((t["time"], msg["kind_text"], preview(t["text"]), t["text"]))
+    if args.image_dir.is_dir():
+        images = sorted(args.image_dir.glob("*.png"), reverse=True)[: args.pick_images]
+        for f in images:
+            entries.append((f.stat().st_mtime, msg["kind_image"], f.name, f))
+    entries.sort(key=lambda e: e[0], reverse=True)
+    if not entries:
+        subprocess.run(["zenity", "--info", f"--text={msg['empty']}"])
+        return
+
+    rows = []
+    for i, (ts, kind, label, _value) in enumerate(entries):
+        rows += [str(i), time.strftime("%m/%d %H:%M", time.localtime(ts)), kind, label]
+    zenity = subprocess.Popen(
+        ["zenity", "--list", f"--title={msg['title']}", "--width=1000", "--height=640",
+         f"--text={msg['text']}", "--column=id"]
+        + [f"--column={c}" for c in msg["columns"]]
+        + ["--hide-column=1", "--print-column=1"] + rows,
+        stdout=subprocess.PIPE, text=True,
+    )
+    lock.write(str(zenity.pid))
+    lock.flush()
+    out, _ = zenity.communicate()
+    choice = out.strip().split("|")[0]
+    if zenity.returncode != 0 or not choice.isdigit():
+        return
+    value = entries[int(choice)][3]
+    # xclip はバックグラウンドに残り、他の誰かがコピーするまでクリップボードを提供し続ける
+    if isinstance(value, Path):
+        subprocess.run(["xclip", "-selection", "clipboard", "-t", "image/png", "-i", str(value)])
+    else:
+        subprocess.run(["xclip", "-selection", "clipboard", "-i"], input=value.encode("utf-8"))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("command", nargs="?", default="daemon", choices=["daemon", "pick"])
+    p.add_argument("--image-dir", type=Path, default=default_image_dir(),
+                   help="画像の保存先 (既定: ピクチャフォルダ/clipboard)")
+    p.add_argument("--text-file", type=Path, default=default_text_file(),
+                   help="テキスト履歴の保存先 (既定: ~/.local/share/clip-history/texts.json)")
+    p.add_argument("--keep-images", type=int, default=300, help="残す画像の枚数 (既定: 300)")
+    p.add_argument("--keep-texts", type=int, default=300, help="残すテキストの件数 (既定: 300)")
+    p.add_argument("--pick-images", type=int, default=30,
+                   help="pick の一覧に出す画像の枚数 (既定: 30)")
+    p.add_argument("--delay-ms", type=int, default=300,
+                   help="所有者変更から取得までの待ち時間 (既定: 300)")
+    p.add_argument("--max-image-mb", type=int, default=64,
+                   help="これより大きい画像は保存しない (既定: 64)")
+    p.add_argument("--max-text-kb", type=int, default=1024,
+                   help="これより大きいテキストは保存しない (既定: 1024)")
+    p.add_argument("-v", "--verbose", action="store_true", help="イベントごとの詳細ログを出す")
+    args = p.parse_args()
+    global DEBUG
+    DEBUG = args.verbose
+    if args.command == "pick":
+        run_pick(args)
+    else:
+        run_daemon(args)
+
+
+if __name__ == "__main__":
+    main()

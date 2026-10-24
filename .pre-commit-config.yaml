@@ -1,0 +1,18 @@
+repos:
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks (秘密情報の検出)
+        entry: gitleaks git --pre-commit --staged --redact --no-banner
+        language: system
+        pass_filenames: false
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck
+        language: system
+        types: [shell]
+      - id: python-compile
+        name: python 構文チェック
+        entry: python3 -m py_compile
+        language: system
+        files: ^bin/clip-history$

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=clip-history
+Comment=Clipboard history (text and images) that is gentle to xrdp
+Exec=sh -c 'exec "$HOME/.local/bin/clip-history" 2>>"$HOME/.cache/clip-history.log"'
+Hidden=false
+X-GNOME-Autostart-enabled=true

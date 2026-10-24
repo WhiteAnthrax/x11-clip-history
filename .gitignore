@@ -1,0 +1,11 @@
+# 実行時の生成物
+__pycache__/
+*.pyc
+*.log
+*.tmp
+output/
+
+# 環境固有のファイル・秘密
+*.orig
+*.env
+!env.example
