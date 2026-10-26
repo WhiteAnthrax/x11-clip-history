@@ -28,10 +28,10 @@ Xvfb 上で chansrv の代わりを置き、1 回のコピーで出る要求を�
 
 ## 機能
 
-- CLIPBOARD にコピーされたテキストと画像を記録する。マウスで選んだだけの文字(PRIMARY)も、別の履歴として記録する。違いは「[CLIPBOARD と PRIMARY](#clipboard-と-primary)」を参照。
+- CLIPBOARD にコピーされたテキストと画像を記録する。`--record-primary` を付けると、マウスで選んだだけの文字(PRIMARY)も別の履歴として記録する(既定では記録しない)。違いは「[CLIPBOARD と PRIMARY](#clipboard-と-primary)」を参照。
 - 画像は PNG に変換して、ピクチャフォルダの下の `clipboard/` に保存する。日本語環境では `~/画像/clipboard/` になる。既定で 300 枚まで残す。
 - テキストは `~/.local/share/clip-history/texts.json` に保存する。権限は 600 で、既定で 300 件まで残す。同じテキストをコピーすると先頭に移る。
-- PRIMARY は `~/.local/share/clip-history/primary.json` に保存する。権限は 600 で、既定で 300 件まで残す。選択が 1 秒変わらなかったら記録する。直前の記録(30 秒以内)を伸ばした、または縮めただけの選択なら、その記録を置き換える。マウスで選んだ文字はすべて残るので、端末に表示されたパスワードを選べばそれも記録される。記録したくない場合は `--no-primary` を付ける。
+- PRIMARY を記録する場合は `~/.local/share/clip-history/primary.json` に保存する。権限は 600 で、既定で 300 件まで残す。選択が 1 秒変わらなかったら記録する。直前の記録(30 秒以内)を伸ばした、または縮めただけの選択なら、その記録を置き換える。マウスで選んだ文字はすべて残るので、端末に表示されたパスワードを選べばそれも記録される。そのため既定ではオフにしている。PRIMARY の文字を残したいときは、Ctrl+Insert などでコピーすれば CLIPBOARD の履歴に入る。
 - `clip-history pick` で履歴を一覧に表示し(画像はサムネイル付き。選んだ項目は右側に大きくプレビュー)、選んだものをクリップボードに戻す。一覧が開いているときにもう一度実行すると閉じるので、Super+V などのキーに割り当てて開閉に使える。
 - `clip-history pick --primary` は PRIMARY の履歴を同じように表示し、選んだものを PRIMARY に戻す(Super+Shift+V)。
 - 画面の文言は、日本語環境なら日本語、それ以外では英語になる。
@@ -50,14 +50,15 @@ Xvfb 上で chansrv の代わりを置き、1 回のコピーで出る要求を�
 git clone https://github.com/WhiteAnthrax/x11-clip-history.git
 cd x11-clip-history
 ./install.sh --dry-run                 # 実行内容を表示するだけ
-./install.sh --bind-super-v --start    # Xfce: Super+V と Super+Shift+V を割り当て、すぐに起動する
+./install.sh --bind-super-v --start    # Xfce: Super+V を割り当て、すぐに起動する
 ```
 
 `install.sh` は次の作業を行います。
 
 - `~/.local/bin/clip-history` から `bin/clip-history` へのシンボリックリンクを作る
 - `~/.config/autostart/clip-history.desktop` を置く
-- `--bind-super-v` を付けると、Super+V に `clip-history pick` を、Super+Shift+V に `clip-history pick --primary` を割り当てる(Xfce のみ)
+- `--bind-super-v` を付けると、Super+V に `clip-history pick` を割り当てる(Xfce のみ)
+- `--record-primary` を付けると、PRIMARY も記録するよう自動起動を設定する。`--bind-super-v` と一緒なら、Super+Shift+V に `clip-history pick --primary` を割り当てる
 - `--start` を付けると、今のセッションで常駐プロセスを起動する
 
 Xfce 以外のデスクトップでは、`~/.local/bin/clip-history pick` を自分でキーに割り当ててください。
@@ -71,7 +72,7 @@ Xfce 以外のデスクトップでは、`~/.local/bin/clip-history pick` を自
 ```sh
 clip-history            # 記録用の常駐プロセス(普段は自動起動で動く)
 clip-history pick       # CLIPBOARD の履歴を表示する
-clip-history pick --primary  # PRIMARY の履歴を表示する
+clip-history pick --primary  # PRIMARY の履歴を表示する(--record-primary 使用時)
 clip-history -h         # オプション(保存先、上限、待ち時間、-v で詳細ログ)
 ```
 

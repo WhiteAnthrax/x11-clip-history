@@ -2,17 +2,19 @@
 # clip-history を現在のユーザーにインストール/アンインストールする。
 #   ~/.local/bin/clip-history  -> このリポジトリの bin/clip-history へのシンボリックリンク
 #   ~/.config/autostart/clip-history.desktop  ログイン時の自動起動
-#   (--bind-super-v 指定時) Xfce の Super+V を "clip-history pick" に、
+#   (--bind-super-v 指定時) Xfce の Super+V を "clip-history pick" に割り当てる
+#   (--record-primary 指定時) PRIMARY も記録する。--bind-super-v と一緒なら
 #   Super+Shift+V を "clip-history pick --primary" に割り当てる
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: install.sh [--bind-super-v] [--start] [--dry-run]
+usage: install.sh [--bind-super-v] [--record-primary] [--start] [--dry-run]
        install.sh --uninstall [--dry-run]
 
-  --bind-super-v  Xfce のキーボードショートカット Super+V を "clip-history pick" に、
-                  Super+Shift+V を "clip-history pick --primary" に割り当てる
+  --bind-super-v    Xfce のキーボードショートカット Super+V を "clip-history pick" に割り当てる
+  --record-primary  PRIMARY(マウスで選んだ文字)も記録する。--bind-super-v と一緒なら
+                    Super+Shift+V を "clip-history pick --primary" に割り当てる
   --start         インストール後、このセッションで常駐プロセスを起動する
   --uninstall     シンボリックリンクと自動起動設定を削除し、常駐プロセスを止める
   --dry-run       実行する内容を表示するだけで、何も変更しない
@@ -29,10 +31,11 @@ autostart="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/clip-history.desktop"
 shortcut='/commands/custom/<Super>v'
 shortcut_primary='/commands/custom/<Shift><Super>v'
 
-bind=0 start=0 uninstall=0 dry_run=0
+bind=0 record_primary=0 start=0 uninstall=0 dry_run=0
 for arg in "$@"; do
   case $arg in
     --bind-super-v) bind=1 ;;
+    --record-primary) record_primary=1 ;;
     --start) start=1 ;;
     --uninstall) uninstall=1 ;;
     --dry-run) dry_run=1 ;;
@@ -82,15 +85,23 @@ run ln -sfn "$repo/bin/clip-history" "$link"
 log "自動起動を設定: $autostart"
 run mkdir -p "$(dirname "$autostart")"
 run cp "$repo/autostart/clip-history.desktop" "$autostart"
+daemon_args=()
+if [[ $record_primary == 1 ]]; then
+  daemon_args=(--record-primary)
+  log "PRIMARY も記録するよう自動起動を設定"
+  run sed -i 's|clip-history"|clip-history" --record-primary|' "$autostart"
+fi
 
 if [[ $bind == 1 ]]; then
   command -v xfconf-query >/dev/null || die "--bind-super-v は Xfce(xfconf-query)専用です"
   log "現在の Super+V: $(xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut" 2>/dev/null || echo '(なし)')"
   log "Super+V を割り当て: $link pick"
   run xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut" -n -t string -s "$link pick"
-  log "現在の Super+Shift+V: $(xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut_primary" 2>/dev/null || echo '(なし)')"
-  log "Super+Shift+V を割り当て: $link pick --primary"
-  run xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut_primary" -n -t string -s "$link pick --primary"
+  if [[ $record_primary == 1 ]]; then
+    log "現在の Super+Shift+V: $(xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut_primary" 2>/dev/null || echo '(なし)')"
+    log "Super+Shift+V を割り当て: $link pick --primary"
+    run xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut_primary" -n -t string -s "$link pick --primary"
+  fi
 fi
 
 if [[ $start == 1 ]]; then
@@ -98,8 +109,8 @@ if [[ $start == 1 ]]; then
   stop_daemon
   log "常駐プロセスを起動 (ログ: ~/.cache/clip-history.log)"
   run mkdir -p "$HOME/.cache"
-  # shellcheck disable=SC2016  # $1 と $HOME は起動される sh 側で展開する
-  run setsid -f sh -c 'exec "$1" 2>>"$HOME/.cache/clip-history.log"' sh "$link"
+  # shellcheck disable=SC2016  # $@ と $HOME は起動される sh 側で展開する
+  run setsid -f sh -c 'exec "$@" </dev/null >/dev/null 2>>"$HOME/.cache/clip-history.log"' sh "$link" "${daemon_args[@]}"
 fi
 
 log "完了。他のクリップボードマネージャ(clipman、CopyQ など)は止めてから使ってください"

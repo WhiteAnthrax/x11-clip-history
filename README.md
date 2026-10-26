@@ -28,10 +28,10 @@ Replacing clipman with clip-history is our current workaround. Whether overlappi
 
 ## Features
 
-- Records text and images copied to the CLIPBOARD selection, and text selected with the mouse (PRIMARY) in a separate history. See [CLIPBOARD and PRIMARY](#clipboard-and-primary).
+- Records text and images copied to the CLIPBOARD selection, and, with `--record-primary`, text selected with the mouse (PRIMARY) in a separate history (off by default). See [CLIPBOARD and PRIMARY](#clipboard-and-primary).
 - Images are converted to PNG and saved under `<Pictures>/clipboard/` (300 files by default).
 - Text is saved to `~/.local/share/clip-history/texts.json` with mode 600 (300 entries by default). Duplicates move to the top.
-- PRIMARY is saved to `~/.local/share/clip-history/primary.json` with mode 600 (300 entries by default). A selection is recorded once it has not changed for 1 second; a selection that only extends or shrinks the previous entry (within 30 seconds) replaces it. Note that everything you select with the mouse is recorded, including passwords shown in a terminal. Use `--no-primary` to turn this off.
+- When enabled, PRIMARY is saved to `~/.local/share/clip-history/primary.json` with mode 600 (300 entries by default). A selection is recorded once it has not changed for 1 second; a selection that only extends or shrinks the previous entry (within 30 seconds) replaces it. Note that everything you select with the mouse is recorded, including passwords shown in a terminal, which is why it is off by default. To keep selected text, copy it (e.g. Ctrl+Insert) so that it goes into the CLIPBOARD history.
 - `clip-history pick` shows the history in a list (images with thumbnails, and a larger preview of the selected item) and copies the selected item back to the clipboard. Running it again while the list is open closes the list, so it can be bound to a key such as Super+V as a toggle.
 - `clip-history pick --primary` does the same for the PRIMARY history and puts the selected item back into PRIMARY (Super+Shift+V).
 - The UI is shown in Japanese on a Japanese locale and in English otherwise.
@@ -50,14 +50,15 @@ Replacing clipman with clip-history is our current workaround. Whether overlappi
 git clone https://github.com/WhiteAnthrax/x11-clip-history.git
 cd x11-clip-history
 ./install.sh --dry-run                 # show what will be done
-./install.sh --bind-super-v --start    # Xfce: bind Super+V and Super+Shift+V, and start now
+./install.sh --bind-super-v --start    # Xfce: bind Super+V and start now
 ```
 
 `install.sh` does the following:
 
 - symlinks `~/.local/bin/clip-history` to `bin/clip-history`
 - installs `~/.config/autostart/clip-history.desktop`
-- with `--bind-super-v`, binds Super+V to `clip-history pick` and Super+Shift+V to `clip-history pick --primary` (Xfce only)
+- with `--bind-super-v`, binds Super+V to `clip-history pick` (Xfce only)
+- with `--record-primary`, makes the autostart entry record PRIMARY too; together with `--bind-super-v`, also binds Super+Shift+V to `clip-history pick --primary`
 - with `--start`, starts the daemon in the current session
 
 On other desktops, bind `~/.local/bin/clip-history pick` to a key yourself.
@@ -71,7 +72,7 @@ Uninstall with `./install.sh --uninstall`. History data is kept.
 ```sh
 clip-history            # run the recorder (normally started by autostart)
 clip-history pick       # show the CLIPBOARD history
-clip-history pick --primary  # show the PRIMARY history
+clip-history pick --primary  # show the PRIMARY history (with --record-primary)
 clip-history -h         # options (storage paths, limits, delay, -v for verbose logs)
 ```
 

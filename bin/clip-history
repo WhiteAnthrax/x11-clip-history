@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """クリップボード履歴(テキストと画像)を、xrdp に優しいやり方で記録・呼び出すツール。
 
-  clip-history [daemon]        常駐して CLIPBOARD と PRIMARY の変化を記録する
+  clip-history [daemon]        常駐して CLIPBOARD の変化を記録する (--record-primary で PRIMARY も)
   clip-history pick            CLIPBOARD の履歴を一覧表示し、選んだものを CLIPBOARD に戻す (Super+V 用)
   clip-history pick --primary  PRIMARY の履歴を一覧表示し、選んだものを PRIMARY に戻す (Super+Shift+V 用)
 
@@ -251,10 +251,10 @@ def run_daemon(args):
     except BlockingIOError:
         sys.exit("既に起動しています")
     Recorder(args)
-    if not args.no_primary:
+    if args.record_primary:
         Recorder(args, primary=True)
     log(f"監視開始: DISPLAY={os.environ['DISPLAY']} 画像={args.image_dir} テキスト={args.text_file}"
-        + ("" if args.no_primary else f" PRIMARY={args.primary_file}"))
+        + (f" PRIMARY={args.primary_file}" if args.record_primary else ""))
     Gtk.main()
 
 
@@ -481,7 +481,9 @@ def main():
     p.add_argument("--primary-file", type=Path, default=default_primary_file(),
                    help="PRIMARY の履歴の保存先 (既定: ~/.local/share/clip-history/primary.json)")
     p.add_argument("--keep-primary", type=int, default=300, help="残す PRIMARY の件数 (既定: 300)")
-    p.add_argument("--no-primary", action="store_true", help="PRIMARY を記録しない")
+    # マウスで選んだ文字はすべて残る(端末のパスワードなども)ので、既定では記録しない
+    p.add_argument("--record-primary", action="store_true",
+                   help="PRIMARY(マウスで選んだ文字)も別の履歴として記録する")
     p.add_argument("--pick-images", type=int, default=30,
                    help="pick の一覧に出す画像の枚数 (既定: 30)")
     p.add_argument("--delay-ms", type=int, default=300,
