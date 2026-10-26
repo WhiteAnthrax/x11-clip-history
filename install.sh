@@ -65,9 +65,7 @@ fi
 # 依存の確認
 python3 -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk' 2>/dev/null ||
   die "PyGObject (GTK 3) が必要です (例: Arch は python-gobject、Debian/Ubuntu は python3-gi gir1.2-gtk-3.0)"
-for cmd in zenity xclip; do
-  command -v "$cmd" >/dev/null || die "$cmd が必要です"
-done
+command -v xclip >/dev/null || die "xclip が必要です"
 
 log "リンク作成: $link -> $repo/bin/clip-history"
 run mkdir -p "$bin_dir"

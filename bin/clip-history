@@ -235,25 +235,143 @@ MESSAGES = {
     True: {
         "empty": "クリップボード履歴はまだありません",
         "title": "クリップボード履歴",
-        "text": "選んだものをクリップボードに戻します (もう一度 Super+V で閉じます)",
+        "text": "Enter かダブルクリックで、選んだものをクリップボードに戻します (Esc かもう一度 Super+V で閉じます)",
         "columns": ["日時", "種類", "内容"],
         "kind_text": "テキスト",
-        "kind_image": "[画像]",
+        "kind_image": "画像",
     },
     False: {
         "empty": "Clipboard history is empty",
         "title": "Clipboard history",
-        "text": "The selected item is copied back to the clipboard (press Super+V again to close)",
+        "text": "Press Enter or double-click to copy the selected item back (Esc or Super+V again to close)",
         "columns": ["Time", "Type", "Content"],
         "kind_text": "Text",
-        "kind_image": "[Image]",
+        "kind_image": "Image",
     },
 }
+
+THUMB_SIZE = (160, 90)  # 一覧のサムネイルの最大の大きさ
+PREVIEW_TEXT_MAX = 20000  # プレビュー欄に出すテキストの最大文字数
 
 
 def preview(text, width=100):
     one = " ⏎ ".join(line.strip() for line in text.strip().splitlines())
     return one if len(one) <= width else one[: width - 1] + "…"
+
+
+class Picker:
+    """履歴の一覧(画像はサムネイル付き)と、選択中の項目のプレビューを表示する"""
+
+    COL_ID, COL_TIME, COL_KIND, COL_THUMB, COL_LABEL = range(5)
+
+    def __init__(self, entries, msg):
+        self.entries = entries  # (時刻, 種類, 表示, 値)
+        self.chosen = None
+        self.store = Gtk.ListStore(int, str, str, GdkPixbuf.Pixbuf, str)
+        for i, (ts, kind, label, _value) in enumerate(entries):
+            when = time.strftime("%m/%d %H:%M", time.localtime(ts))
+            self.store.append([i, when, kind, None, label])
+
+        self.view = Gtk.TreeView(model=self.store)
+        self.view.set_search_column(self.COL_LABEL)  # キー入力で内容を検索できる
+        for title, col in ((msg["columns"][0], self.COL_TIME), (msg["columns"][1], self.COL_KIND)):
+            self.view.append_column(Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=col))
+        content = Gtk.TreeViewColumn(msg["columns"][2])
+        area = content.get_area()
+        thumb = Gtk.CellRendererPixbuf(xalign=0)
+        # fixed=False にして、サムネイルのないテキストの行は左に詰める
+        area.pack_start(thumb, False, False, False)
+        content.add_attribute(thumb, "pixbuf", self.COL_THUMB)
+        content.set_cell_data_func(thumb, self.thumb_visible)
+        label = Gtk.CellRendererText()
+        area.pack_start(label, True, False, False)
+        content.add_attribute(label, "text", self.COL_LABEL)
+        self.view.append_column(content)
+        self.view.connect("row-activated", self.on_activated)
+        self.view.get_selection().connect("changed", self.on_selected)
+
+        self.image = Gtk.Image()
+        self.text = Gtk.TextView(editable=False, cursor_visible=False,
+                                 wrap_mode=Gtk.WrapMode.WORD_CHAR, left_margin=6, right_margin=6)
+        self.stack = Gtk.Stack()
+        for name, child in (("image", self.image), ("text", self.text)):
+            scroll = Gtk.ScrolledWindow()
+            scroll.add(child)
+            self.stack.add_named(scroll, name)
+
+        list_scroll = Gtk.ScrolledWindow()
+        list_scroll.add(self.view)
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.pack1(list_scroll, True, False)
+        paned.pack2(self.stack, True, False)
+        paned.set_position(600)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, border_width=6)
+        box.pack_start(Gtk.Label(label=msg["text"], xalign=0), False, False, 0)
+        box.pack_start(paned, True, True, 0)
+
+        self.window = Gtk.Window(title=msg["title"], default_width=1100, default_height=680)
+        self.window.set_position(Gtk.WindowPosition.CENTER)
+        self.window.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.window.set_keep_above(True)
+        self.window.add(box)
+        self.window.connect("key-press-event", self.on_key)
+        self.window.connect("destroy", Gtk.main_quit)
+        self.window.show_all()
+        self.view.set_cursor(Gtk.TreePath.new_first(), None, False)
+        self.view.grab_focus()
+        self.window.present()
+
+        # サムネイルは表示後に 1 枚ずつ読み込み、大きな画像があっても一覧をすぐに出す
+        self.pending_thumbs = [row.iter for row in self.store
+                               if isinstance(entries[row[self.COL_ID]][3], Path)]
+        GLib.idle_add(self.load_next_thumb)
+
+    def thumb_visible(self, _column, cell, model, it, _data):
+        cell.set_visible(isinstance(self.entries[model[it][self.COL_ID]][3], Path))
+
+    def load_next_thumb(self):
+        if not self.pending_thumbs:
+            return False
+        it = self.pending_thumbs.pop(0)
+        path = self.entries[self.store[it][self.COL_ID]][3]
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), *THUMB_SIZE, True)
+            self.store.set_value(it, self.COL_THUMB, pixbuf)
+        except GLib.Error as e:
+            log(f"{path}: サムネイルを作れませんでした: {e.message}")
+        return True
+
+    def on_selected(self, selection):
+        model, it = selection.get_selected()
+        if it is None:
+            return
+        value = self.entries[model[it][self.COL_ID]][3]
+        if isinstance(value, Path):
+            alloc = self.stack.get_allocation()
+            w, h = max(alloc.width - 20, 200), max(alloc.height - 20, 200)
+            try:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(value))
+                # 元の大きさより拡大はしない
+                if pixbuf.get_width() > w or pixbuf.get_height() > h:
+                    pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(value), w, h, True)
+                self.image.set_from_pixbuf(pixbuf)
+            except GLib.Error as e:
+                self.image.clear()
+                log(f"{value}: プレビューを表示できませんでした: {e.message}")
+            self.stack.set_visible_child_name("image")
+        else:
+            self.text.get_buffer().set_text(value[:PREVIEW_TEXT_MAX])
+            self.stack.set_visible_child_name("text")
+
+    def on_activated(self, view, path, _column):
+        self.chosen = self.entries[self.store[path][self.COL_ID]][3]
+        self.window.destroy()
+
+    def on_key(self, _window, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.window.destroy()
+            return True
+        return False
 
 
 def run_pick(args):
@@ -272,6 +390,8 @@ def run_pick(args):
         return
     lock.seek(0)
     lock.truncate()
+    lock.write(str(os.getpid()))
+    lock.flush()
 
     msg = MESSAGES[is_japanese()]
     entries = []  # (時刻, 種類, 表示, 値)
@@ -283,26 +403,17 @@ def run_pick(args):
             entries.append((f.stat().st_mtime, msg["kind_image"], f.name, f))
     entries.sort(key=lambda e: e[0], reverse=True)
     if not entries:
-        subprocess.run(["zenity", "--info", f"--text={msg['empty']}"])
+        dialog = Gtk.MessageDialog(message_type=Gtk.MessageType.INFO,
+                                   buttons=Gtk.ButtonsType.OK, text=msg["empty"])
+        dialog.set_keep_above(True)
+        dialog.run()
         return
 
-    rows = []
-    for i, (ts, kind, label, _value) in enumerate(entries):
-        rows += [str(i), time.strftime("%m/%d %H:%M", time.localtime(ts)), kind, label]
-    zenity = subprocess.Popen(
-        ["zenity", "--list", f"--title={msg['title']}", "--width=1000", "--height=640",
-         f"--text={msg['text']}", "--column=id"]
-        + [f"--column={c}" for c in msg["columns"]]
-        + ["--hide-column=1", "--print-column=1"] + rows,
-        stdout=subprocess.PIPE, text=True,
-    )
-    lock.write(str(zenity.pid))
-    lock.flush()
-    out, _ = zenity.communicate()
-    choice = out.strip().split("|")[0]
-    if zenity.returncode != 0 or not choice.isdigit():
+    picker = Picker(entries, msg)
+    Gtk.main()
+    value = picker.chosen
+    if value is None:
         return
-    value = entries[int(choice)][3]
     # xclip はバックグラウンドに残り、他の誰かがコピーするまでクリップボードを提供し続ける
     if isinstance(value, Path):
         subprocess.run(["xclip", "-selection", "clipboard", "-t", "image/png", "-i", str(value)])

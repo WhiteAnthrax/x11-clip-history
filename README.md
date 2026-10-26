@@ -31,7 +31,7 @@ Replacing clipman with clip-history is our current workaround. Whether overlappi
 - Records text and images copied to the CLIPBOARD selection. PRIMARY is ignored.
 - Images are converted to PNG and saved under `<Pictures>/clipboard/` (300 files by default).
 - Text is saved to `~/.local/share/clip-history/texts.json` with mode 600 (300 entries by default). Duplicates move to the top.
-- `clip-history pick` shows the history in a zenity list and copies the selected item back to the clipboard. Running it again while the list is open closes the list, so it can be bound to a key such as Super+V as a toggle.
+- `clip-history pick` shows the history in a list (images with thumbnails, and a larger preview of the selected item) and copies the selected item back to the clipboard. Running it again while the list is open closes the list, so it can be bound to a key such as Super+V as a toggle.
 - The UI is shown in Japanese on a Japanese locale and in English otherwise.
 
 ## Requirements
@@ -40,7 +40,7 @@ Replacing clipman with clip-history is our current workaround. Whether overlappi
 - Python 3 and PyGObject (GTK 3)
   - Arch: `python-gobject`
   - Debian/Ubuntu: `python3-gi gir1.2-gtk-3.0`
-- `zenity`, `xclip`
+- `xclip`
 
 ## Install
 
