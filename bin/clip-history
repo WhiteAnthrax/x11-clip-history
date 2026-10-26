@@ -120,7 +120,10 @@ class Recorder:
         self.busy = True
         self.req += 1
         self.watchdog = GLib.timeout_add(self.REQUEST_TIMEOUT_MS, self.on_timeout, self.req)
-        self.clipboard.request_targets(self.on_targets, self.req)
+        # request_targets は使わない。応答が失敗すると、コールバックが atoms=NULL・個数=-1 で
+        # 呼ばれ、PyGObject がその配列を変換するときに segfault する(PyGObject 3.58.1、GTK 3.24.52 で確認)。
+        # TARGETS を普通のデータとして要求し、長さを確かめてから読む
+        self.clipboard.request_contents(Gdk.Atom.intern("TARGETS", False), self.on_targets, self.req)
         return False
 
     def on_timeout(self, req):
@@ -140,10 +143,14 @@ class Recorder:
             self.pending = False
             self.check()
 
-    def on_targets(self, _clipboard, atoms, _n, req):
+    def on_targets(self, _clipboard, selection, req):
         if req != self.req:
             return
-        names = [a.name() for a in (atoms or [])]
+        names = []
+        if selection and selection.get_length() > 0:
+            ok, atoms = selection.get_targets()
+            if ok:
+                names = [a.name() for a in atoms]
         debug(f"{self.name}: targets={names}")
         # 画像とテキストの両方があれば画像を優先する(ブラウザの画像コピーなど)
         candidates = IMAGE_TARGETS + TEXT_TARGETS if self.images else TEXT_TARGETS
