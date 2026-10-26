@@ -2,7 +2,8 @@
 # clip-history を現在のユーザーにインストール/アンインストールする。
 #   ~/.local/bin/clip-history  -> このリポジトリの bin/clip-history へのシンボリックリンク
 #   ~/.config/autostart/clip-history.desktop  ログイン時の自動起動
-#   (--bind-super-v 指定時) Xfce の Super+V を "clip-history pick" に割り当てる
+#   (--bind-super-v 指定時) Xfce の Super+V を "clip-history pick" に、
+#   Super+Shift+V を "clip-history pick --primary" に割り当てる
 set -euo pipefail
 
 usage() {
@@ -10,7 +11,8 @@ usage() {
 usage: install.sh [--bind-super-v] [--start] [--dry-run]
        install.sh --uninstall [--dry-run]
 
-  --bind-super-v  Xfce のキーボードショートカット Super+V を "clip-history pick" に割り当てる
+  --bind-super-v  Xfce のキーボードショートカット Super+V を "clip-history pick" に、
+                  Super+Shift+V を "clip-history pick --primary" に割り当てる
   --start         インストール後、このセッションで常駐プロセスを起動する
   --uninstall     シンボリックリンクと自動起動設定を削除し、常駐プロセスを止める
   --dry-run       実行する内容を表示するだけで、何も変更しない
@@ -25,6 +27,7 @@ bin_dir="$HOME/.local/bin"
 link="$bin_dir/clip-history"
 autostart="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/clip-history.desktop"
 shortcut='/commands/custom/<Super>v'
+shortcut_primary='/commands/custom/<Shift><Super>v'
 
 bind=0 start=0 uninstall=0 dry_run=0
 for arg in "$@"; do
@@ -53,10 +56,15 @@ if [[ $uninstall == 1 ]]; then
   stop_daemon
   [[ -L $link ]] && { log "削除: $link"; run rm "$link"; }
   [[ -f $autostart ]] && { log "削除: $autostart"; run rm "$autostart"; }
-  if command -v xfconf-query >/dev/null &&
-     [[ $(xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut" 2>/dev/null) == *"clip-history pick" ]]; then
-    log "Super+V の割り当てを削除"
-    run xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut" -r
+  if command -v xfconf-query >/dev/null; then
+    if [[ $(xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut" 2>/dev/null) == *"clip-history pick" ]]; then
+      log "Super+V の割り当てを削除"
+      run xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut" -r
+    fi
+    if [[ $(xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut_primary" 2>/dev/null) == *"clip-history pick --primary" ]]; then
+      log "Super+Shift+V の割り当てを削除"
+      run xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut_primary" -r
+    fi
   fi
   log "履歴データ(~/.local/share/clip-history、ピクチャ/clipboard)は残しています"
   exit 0
@@ -80,6 +88,9 @@ if [[ $bind == 1 ]]; then
   log "現在の Super+V: $(xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut" 2>/dev/null || echo '(なし)')"
   log "Super+V を割り当て: $link pick"
   run xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut" -n -t string -s "$link pick"
+  log "現在の Super+Shift+V: $(xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut_primary" 2>/dev/null || echo '(なし)')"
+  log "Super+Shift+V を割り当て: $link pick --primary"
+  run xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut_primary" -n -t string -s "$link pick --primary"
 fi
 
 if [[ $start == 1 ]]; then

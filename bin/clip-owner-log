@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""CLIPBOARD の所有者が変わるたびに、時刻・所有ウィンドウ・プロセスを 1 行ずつ記録する。
+
+xrdp のクリップボード共有が止まったとき、クライアントからのコピーで xrdp-chansrv が
+所有者になったか(= クライアントが形式一覧を送ってきたか)、その後に誰が所有者を
+奪ったかを時刻つきで追うための診断用。中身や形式は要求しない(chansrv に負担をかけない)。
+
+  clip-owner-log [--selection CLIPBOARD] >> ~/.cache/clip-owner.log
+"""
+import argparse
+import ctypes
+import ctypes.util
+import sys
+import time
+
+x11 = ctypes.cdll.LoadLibrary(ctypes.util.find_library("X11"))
+xfixes = ctypes.cdll.LoadLibrary(ctypes.util.find_library("Xfixes"))
+xres = ctypes.cdll.LoadLibrary(ctypes.util.find_library("XRes"))
+
+x11.XOpenDisplay.restype = ctypes.c_void_p
+x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x11.XInternAtom.restype = ctypes.c_ulong
+x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+x11.XDefaultRootWindow.restype = ctypes.c_ulong
+x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+xfixes.XFixesQueryExtension.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                                        ctypes.POINTER(ctypes.c_int)]
+xfixes.XFixesSelectSelectionInput.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                              ctypes.c_ulong, ctypes.c_ulong]
+
+# XFixes の SelectionNotify の各通知
+SET_OWNER = 1 << 0
+WINDOW_DESTROY = 1 << 1
+CLIENT_CLOSE = 1 << 2
+SUBTYPES = {0: "set-owner", 1: "window-destroy", 2: "client-close"}
+
+
+class XFixesSelectionNotifyEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("subtype", ctypes.c_int),
+        ("owner", ctypes.c_ulong),
+        ("selection", ctypes.c_ulong),
+        ("timestamp", ctypes.c_ulong),
+        ("selection_timestamp", ctypes.c_ulong),
+    ]
+
+
+class XResClientIdSpec(ctypes.Structure):
+    _fields_ = [("client", ctypes.c_ulong), ("mask", ctypes.c_uint)]
+
+
+class XResClientIdValue(ctypes.Structure):
+    _fields_ = [("spec", XResClientIdSpec), ("length", ctypes.c_long),
+                ("value", ctypes.c_void_p)]
+
+
+XRES_CLIENT_ID_PID_MASK = 1 << 1
+xres.XResQueryClientIds.argtypes = [ctypes.c_void_p, ctypes.c_long,
+                                    ctypes.POINTER(XResClientIdSpec),
+                                    ctypes.POINTER(ctypes.c_long),
+                                    ctypes.POINTER(ctypes.POINTER(XResClientIdValue))]
+xres.XResGetClientPid.restype = ctypes.c_int
+xres.XResGetClientPid.argtypes = [ctypes.POINTER(XResClientIdValue)]
+xres.XResClientIdsDestroy.argtypes = [ctypes.c_long, ctypes.POINTER(XResClientIdValue)]
+
+
+def owner_pid(dpy, window):
+    """ウィンドウを作った X クライアントの PID。分からなければ None"""
+    if window == 0:
+        return None
+    spec = XResClientIdSpec(window, XRES_CLIENT_ID_PID_MASK)
+    num = ctypes.c_long(0)
+    ids = ctypes.POINTER(XResClientIdValue)()
+    if xres.XResQueryClientIds(dpy, 1, ctypes.byref(spec), ctypes.byref(num), ctypes.byref(ids)):
+        return None
+    pid = None
+    for i in range(num.value):
+        p = xres.XResGetClientPid(ctypes.byref(ids[i]))
+        if p > 0:
+            pid = p
+    xres.XResClientIdsDestroy(num, ids)
+    return pid
+
+
+def comm(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip()
+    except OSError:
+        return "?"
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--selection", default="CLIPBOARD")
+    args = p.parse_args()
+
+    dpy = x11.XOpenDisplay(None)
+    if not dpy:
+        sys.exit("X に接続できません (DISPLAY を確認)")
+    base, err = ctypes.c_int(), ctypes.c_int()
+    if not xfixes.XFixesQueryExtension(dpy, ctypes.byref(base), ctypes.byref(err)):
+        sys.exit("XFixes 拡張がありません")
+    sel = x11.XInternAtom(dpy, args.selection.encode(), 0)
+    xfixes.XFixesSelectSelectionInput(dpy, x11.XDefaultRootWindow(dpy), sel,
+                                      SET_OWNER | WINDOW_DESTROY | CLIENT_CLOSE)
+    print(f"[{stamp()}] start selection={args.selection}", flush=True)
+
+    buf = ctypes.create_string_buffer(192)  # XEvent の大きさ
+    while True:
+        x11.XNextEvent(dpy, buf)
+        ev = XFixesSelectionNotifyEvent.from_buffer(buf)
+        if ev.type != base.value:  # XFixesSelectionNotify
+            continue
+        pid = owner_pid(dpy, ev.owner)
+        name = comm(pid) if pid else "-"
+        print(f"[{stamp()}] {SUBTYPES.get(ev.subtype, ev.subtype)} "
+              f"owner=0x{ev.owner:x} pid={pid or '-'} {name}", flush=True)
+
+
+def stamp():
+    t = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t)) + f".{int(t % 1 * 1000):03d}"
+
+
+if __name__ == "__main__":
+    main()

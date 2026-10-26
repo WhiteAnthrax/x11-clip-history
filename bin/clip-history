@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """クリップボード履歴(テキストと画像)を、xrdp に優しいやり方で記録・呼び出すツール。
 
-  clip-history [daemon]   常駐してクリップボードの変化を記録する
-  clip-history pick       履歴を一覧表示し、選んだものをクリップボードに戻す (Super+V 用)
+  clip-history [daemon]        常駐して CLIPBOARD と PRIMARY の変化を記録する
+  clip-history pick            CLIPBOARD の履歴を一覧表示し、選んだものを CLIPBOARD に戻す (Super+V 用)
+  clip-history pick --primary  PRIMARY の履歴を一覧表示し、選んだものを PRIMARY に戻す (Super+Shift+V 用)
+
+CLIPBOARD はコピー(Ctrl+C)した内容で、Ctrl+V で貼る。xrdp が中継するのはこちらだけ。
+PRIMARY はマウスで選んだだけの文字で、中ボタンや端末の Shift+Insert で貼る。
 
 xrdp-chansrv は応答待ちの要求を 1 件しか保持できず、要求が重なると片方が応答されない。
 そのため、所有者が変わるたびに TARGETS を確認し、実際に提供されている形式を 1 回だけ要求する。
 (clipman は画像で png/jpeg/gif/bmp を順に、CopyQ は同じ形式を 5 回要求していた)
-画像は PNG ファイル、テキストは JSON(mode 600)に保存する。
+画像は PNG ファイル、テキストは JSON(mode 600)に保存する。PRIMARY はテキストだけを記録する。
 """
 import argparse
 import fcntl
@@ -52,6 +56,10 @@ def default_text_file():
     return Path(GLib.get_user_data_dir()) / "clip-history" / "texts.json"
 
 
+def default_primary_file():
+    return Path(GLib.get_user_data_dir()) / "clip-history" / "primary.json"
+
+
 def load_texts(path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -72,16 +80,23 @@ def write_private(path, data):
 class Recorder:
     # 応答が来ないまま待ち続けないための上限
     REQUEST_TIMEOUT_MS = 30000
+    # PRIMARY で、直前の記録を伸ばした/縮めただけの選択を同じ 1 件として扱う時間
+    MERGE_WINDOW_S = 30
 
-    def __init__(self, args):
+    def __init__(self, args, primary=False):
+        """primary=False なら CLIPBOARD(テキストと画像)、True なら PRIMARY(テキストのみ)を記録する"""
+        self.name = "PRIMARY" if primary else "CLIPBOARD"
+        self.images = not primary
+        # ドラッグ中の途中の選択を 1 件ずつ残さないよう、PRIMARY は前の記録と統合する
+        self.merge = primary
         self.image_dir = args.image_dir
-        self.text_file = args.text_file
+        self.text_file = args.primary_file if primary else args.text_file
         self.keep_images = args.keep_images
-        self.keep_texts = args.keep_texts
-        self.delay_ms = args.delay_ms
+        self.keep_texts = args.keep_primary if primary else args.keep_texts
+        self.delay_ms = args.primary_delay_ms if primary else args.delay_ms
         self.max_image = args.max_image_mb * 1024 * 1024
         self.max_text = args.max_text_kb * 1024
-        self.clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self.clipboard = Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY if primary else Gdk.SELECTION_CLIPBOARD)
         self.timer = 0
         self.watchdog = 0
         self.req = 0  # 現在の要求の番号。古い要求への遅れた応答を無視するため
@@ -90,7 +105,7 @@ class Recorder:
         self.clipboard.connect("owner-change", self.on_owner_change)
 
     def on_owner_change(self, _clipboard, event):
-        debug(f"owner-change reason={event.reason}")
+        debug(f"{self.name}: owner-change reason={event.reason}")
         # 連続した所有者変更はまとめて 1 回だけ処理する
         if self.timer:
             GLib.source_remove(self.timer)
@@ -110,7 +125,7 @@ class Recorder:
 
     def on_timeout(self, req):
         self.watchdog = 0
-        log(f"要求 {req} の応答がありません。待ちを解除します")
+        log(f"{self.name}: 要求 {req} の応答がありません。待ちを解除します")
         self.finish(req)
         return False
 
@@ -129,9 +144,10 @@ class Recorder:
         if req != self.req:
             return
         names = [a.name() for a in (atoms or [])]
-        debug(f"targets={names}")
+        debug(f"{self.name}: targets={names}")
         # 画像とテキストの両方があれば画像を優先する(ブラウザの画像コピーなど)
-        target = next((t for t in IMAGE_TARGETS + TEXT_TARGETS if t in names), None)
+        candidates = IMAGE_TARGETS + TEXT_TARGETS if self.images else TEXT_TARGETS
+        target = next((t for t in candidates if t in names), None)
         if target is None:
             self.finish(req)
             return
@@ -146,18 +162,18 @@ class Recorder:
         try:
             # 失敗した応答は length < 0。この状態で get_data を呼ぶと GLib が警告を出す
             length = selection.get_length() if selection else -1
-            debug(f"{target}: length={length}")
+            debug(f"{self.name} {target}: length={length}")
             limit = self.max_image if target.startswith("image/") else self.max_text
             if length <= 0:
-                log(f"{target}: データを取得できませんでした (length={length})")
+                log(f"{self.name} {target}: データを取得できませんでした (length={length})")
             elif length > limit:
-                log(f"{target}: {length} bytes は上限超過のため保存しません")
+                log(f"{self.name} {target}: {length} bytes は上限超過のため保存しません")
             elif target.startswith("image/"):
                 self.save_image(selection.get_data(), target)
             else:
                 self.save_text(selection.get_data(), target)
         except Exception as e:  # 常駐を止めないため、失敗はログだけ残す
-            log(f"{target}: 保存に失敗しました: {e}")
+            log(f"{self.name} {target}: 保存に失敗しました: {e}")
         self.finish(req)
 
     def save_text(self, data, target):
@@ -165,11 +181,16 @@ class Recorder:
         text = data.decode(enc, errors="replace")
         if not text.strip():
             return
-        texts = [t for t in load_texts(self.text_file) if t["text"] != text]
-        texts.insert(0, {"time": int(time.time()), "text": text})
+        now = int(time.time())
+        texts = load_texts(self.text_file)
+        if self.merge and texts and now - texts[0]["time"] <= self.MERGE_WINDOW_S \
+                and extends(texts[0]["text"], text):
+            texts.pop(0)
+        texts = [t for t in texts if t["text"] != text]
+        texts.insert(0, {"time": now, "text": text})
         del texts[self.keep_texts:]
         write_private(self.text_file, json.dumps(texts, ensure_ascii=False).encode("utf-8"))
-        debug(f"テキストを記録 ({len(text)} 文字)")
+        debug(f"{self.name}: テキストを記録 ({len(text)} 文字)")
 
     def save_image(self, data, target):
         self.image_dir.mkdir(parents=True, exist_ok=True)
@@ -201,6 +222,11 @@ class Recorder:
         return False
 
 
+def extends(old, new):
+    """new が old を伸ばした、または縮めただけの選択か(先頭か末尾を共有している)"""
+    return new.startswith(old) or new.endswith(old) or old.startswith(new) or old.endswith(new)
+
+
 def lock_path(name):
     """ディスプレイごとの lock ファイルのパス"""
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
@@ -218,7 +244,10 @@ def run_daemon(args):
     except BlockingIOError:
         sys.exit("既に起動しています")
     Recorder(args)
-    log(f"監視開始: DISPLAY={os.environ['DISPLAY']} 画像={args.image_dir} テキスト={args.text_file}")
+    if not args.no_primary:
+        Recorder(args, primary=True)
+    log(f"監視開始: DISPLAY={os.environ['DISPLAY']} 画像={args.image_dir} テキスト={args.text_file}"
+        + ("" if args.no_primary else f" PRIMARY={args.primary_file}"))
     Gtk.main()
 
 
@@ -234,16 +263,22 @@ def is_japanese():
 MESSAGES = {
     True: {
         "empty": "クリップボード履歴はまだありません",
-        "title": "クリップボード履歴",
-        "text": "Enter かダブルクリックで、選んだものをクリップボードに戻します (Esc かもう一度 Super+V で閉じます)",
+        "title": "クリップボード履歴 (コピー: CLIPBOARD)",
+        "text": "Enter かダブルクリックで、選んだものをクリップボードに戻します (Ctrl+V で貼れます。Esc かもう一度 Super+V で閉じます)",
+        "empty_primary": "選択の履歴はまだありません",
+        "title_primary": "選択の履歴 (マウスで選んだ文字: PRIMARY)",
+        "text_primary": "Enter かダブルクリックで、選んだものを PRIMARY に戻します (中ボタンや端末の Shift+Insert で貼れます。Esc かもう一度 Super+Shift+V で閉じます)",
         "columns": ["日時", "種類", "内容"],
         "kind_text": "テキスト",
         "kind_image": "画像",
     },
     False: {
         "empty": "Clipboard history is empty",
-        "title": "Clipboard history",
-        "text": "Press Enter or double-click to copy the selected item back (Esc or Super+V again to close)",
+        "title": "Clipboard history (copied: CLIPBOARD)",
+        "text": "Press Enter or double-click to copy the selected item back (paste with Ctrl+V; Esc or Super+V again to close)",
+        "empty_primary": "Selection history is empty",
+        "title_primary": "Selection history (mouse selection: PRIMARY)",
+        "text_primary": "Press Enter or double-click to put the selected item back into PRIMARY (paste with middle click or Shift+Insert in terminals; Esc or Super+Shift+V again to close)",
         "columns": ["Time", "Type", "Content"],
         "kind_text": "Text",
         "kind_image": "Image",
@@ -375,8 +410,8 @@ class Picker:
 
 
 def run_pick(args):
-    # 一覧は 1 つだけ。既に開いていれば、それを閉じて終わる(Super+V でトグル)
-    lock = open(lock_path("clip-history-pick"), "a+")
+    # 一覧は種類ごとに 1 つだけ。既に開いていれば、それを閉じて終わる(Super+V でトグル)
+    lock = open(lock_path("clip-history-pick-primary" if args.primary else "clip-history-pick"), "a+")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -393,11 +428,14 @@ def run_pick(args):
     lock.write(str(os.getpid()))
     lock.flush()
 
-    msg = MESSAGES[is_japanese()]
+    msg = dict(MESSAGES[is_japanese()])
+    if args.primary:
+        for key in ("empty", "title", "text"):
+            msg[key] = msg[key + "_primary"]
     entries = []  # (時刻, 種類, 表示, 値)
-    for t in load_texts(args.text_file):
+    for t in load_texts(args.primary_file if args.primary else args.text_file):
         entries.append((t["time"], msg["kind_text"], preview(t["text"]), t["text"]))
-    if args.image_dir.is_dir():
+    if not args.primary and args.image_dir.is_dir():
         images = sorted(args.image_dir.glob("*.png"), reverse=True)[: args.pick_images]
         for f in images:
             entries.append((f.stat().st_mtime, msg["kind_image"], f.name, f))
@@ -415,10 +453,11 @@ def run_pick(args):
     if value is None:
         return
     # xclip はバックグラウンドに残り、他の誰かがコピーするまでクリップボードを提供し続ける
+    selection = "primary" if args.primary else "clipboard"
     if isinstance(value, Path):
-        subprocess.run(["xclip", "-selection", "clipboard", "-t", "image/png", "-i", str(value)])
+        subprocess.run(["xclip", "-selection", selection, "-t", "image/png", "-i", str(value)])
     else:
-        subprocess.run(["xclip", "-selection", "clipboard", "-i"], input=value.encode("utf-8"))
+        subprocess.run(["xclip", "-selection", selection, "-i"], input=value.encode("utf-8"))
 
 
 def main():
@@ -430,10 +469,18 @@ def main():
                    help="テキスト履歴の保存先 (既定: ~/.local/share/clip-history/texts.json)")
     p.add_argument("--keep-images", type=int, default=300, help="残す画像の枚数 (既定: 300)")
     p.add_argument("--keep-texts", type=int, default=300, help="残すテキストの件数 (既定: 300)")
+    p.add_argument("--primary", action="store_true",
+                   help="pick で PRIMARY(マウスで選んだ文字)の履歴を出し、選んだものを PRIMARY に戻す")
+    p.add_argument("--primary-file", type=Path, default=default_primary_file(),
+                   help="PRIMARY の履歴の保存先 (既定: ~/.local/share/clip-history/primary.json)")
+    p.add_argument("--keep-primary", type=int, default=300, help="残す PRIMARY の件数 (既定: 300)")
+    p.add_argument("--no-primary", action="store_true", help="PRIMARY を記録しない")
     p.add_argument("--pick-images", type=int, default=30,
                    help="pick の一覧に出す画像の枚数 (既定: 30)")
     p.add_argument("--delay-ms", type=int, default=300,
                    help="所有者変更から取得までの待ち時間 (既定: 300)")
+    p.add_argument("--primary-delay-ms", type=int, default=1000,
+                   help="PRIMARY で、選択が変わらなくなってから取得するまでの待ち時間 (既定: 1000)")
     p.add_argument("--max-image-mb", type=int, default=64,
                    help="これより大きい画像は保存しない (既定: 64)")
     p.add_argument("--max-text-kb", type=int, default=1024,
