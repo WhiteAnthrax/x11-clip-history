@@ -11,7 +11,8 @@ PRIMARY はマウスで選んだだけの文字で、中ボタンや端末の Sh
 xrdp-chansrv は応答待ちの要求を 1 件しか保持できず、要求が重なると片方が応答されない。
 そのため、所有者が変わるたびに TARGETS を確認し、実際に提供されている形式を 1 回だけ要求する。
 (clipman は画像で png/jpeg/gif/bmp を順に、CopyQ は同じ形式を 5 回要求していた)
-画像は PNG ファイル、テキストは JSON(mode 600)に保存する。PRIMARY はテキストだけを記録する。
+画像は PNG ファイルに保存し、テキストと画像の一覧は SQLite(mode 600)に記録する。
+PRIMARY はテキストだけを記録する。
 """
 import argparse
 import fcntl
@@ -19,6 +20,7 @@ import hashlib
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -52,29 +54,86 @@ def default_image_dir():
     return Path(pictures or Path.home() / "Pictures") / "clipboard"
 
 
-def default_text_file():
-    return Path(GLib.get_user_data_dir()) / "clip-history" / "texts.json"
+def thumb_path(image):
+    """一覧用サムネイルのキャッシュの場所。画像のファイル名にはハッシュが入るので名前で対応づける"""
+    return Path(GLib.get_user_cache_dir()) / "clip-history" / "thumbs" / image.name
 
 
-def default_primary_file():
-    return Path(GLib.get_user_data_dir()) / "clip-history" / "primary.json"
+def default_db():
+    return Path(GLib.get_user_data_dir()) / "clip-history" / "history.db"
 
 
-def load_texts(path):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError):
-        return []
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS entries (
+    id INTEGER PRIMARY KEY,
+    selection TEXT NOT NULL,  -- CLIPBOARD / PRIMARY
+    time INTEGER NOT NULL,
+    kind TEXT NOT NULL,       -- text / image
+    text TEXT,                -- kind=text の本文
+    path TEXT,                -- kind=image の PNG ファイル
+    hash TEXT NOT NULL,       -- 受け取ったデータのハッシュ(重複の判定に使う)
+    png_hash TEXT,            -- 保存した PNG のハッシュ(pick で戻した画像の再記録を防ぐ)
+    UNIQUE (selection, hash)
+);
+CREATE INDEX IF NOT EXISTS entries_order ON entries (selection, time DESC, id DESC);
+CREATE INDEX IF NOT EXISTS entries_png ON entries (png_hash);
+"""
+
+ORDER = "ORDER BY time DESC, id DESC"
 
 
-def write_private(path, data):
-    """他ユーザーから読めない権限で原子的に書き込む"""
+def open_db(path):
+    """履歴の DB を開く。本文が入るので、ファイルは本人だけが読める権限で作る"""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-    tmp.rename(path)
+    os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))
+    db = sqlite3.connect(path, timeout=10)
+    # WAL なら、常駐プロセスが書いている間も pick が読める(-wal/-shm も DB と同じ権限で作られる)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript(SCHEMA)
+    return db
+
+
+def text_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def data_hash(data):
+    """画像のハッシュ。ファイル名にも入れる"""
+    return hashlib.sha256(data).hexdigest()[:12]
+
+
+def migrate(db, image_dir):
+    """JSON 版のテキスト履歴と、DB にまだ無い画像ファイルを取り込む"""
+    data_dir = Path(GLib.get_user_data_dir()) / "clip-history"
+    with db:
+        for name, selection in (("texts.json", "CLIPBOARD"), ("primary.json", "PRIMARY")):
+            src = data_dir / name
+            if not src.exists():
+                continue
+            try:
+                texts = json.loads(src.read_text(encoding="utf-8"))
+            except ValueError:
+                texts = []
+            # JSON は新しい順なので、古いものから入れる
+            for t in reversed(texts):
+                db.execute("INSERT OR IGNORE INTO entries (selection, time, kind, text, hash) "
+                           "VALUES (?, ?, 'text', ?, ?)",
+                           (selection, t["time"], t["text"], text_hash(t["text"])))
+            src.rename(src.with_name(name + ".migrated"))
+            log(f"{src} の {len(texts)} 件を DB に取り込みました ({name}.migrated として残しています)")
+        known = {row[0] for row in db.execute("SELECT path FROM entries WHERE kind = 'image'")}
+        added = 0
+        for f in sorted(image_dir.glob("*.png")) if image_dir.is_dir() else []:
+            if str(f) in known:
+                continue
+            # ファイル名は 日付-時刻-ハッシュ.png
+            digest = f.stem.rsplit("-", 1)[-1]
+            db.execute("INSERT OR IGNORE INTO entries (selection, time, kind, path, hash, png_hash) "
+                       "VALUES ('CLIPBOARD', ?, 'image', ?, ?, ?)",
+                       (int(f.stat().st_mtime), str(f), digest, data_hash(f.read_bytes())))
+            added += 1
+        if added:
+            log(f"{image_dir} の画像 {added} 枚を DB に登録しました")
 
 
 class Recorder:
@@ -83,14 +142,14 @@ class Recorder:
     # PRIMARY で、直前の記録を伸ばした/縮めただけの選択を同じ 1 件として扱う時間
     MERGE_WINDOW_S = 30
 
-    def __init__(self, args, primary=False):
+    def __init__(self, args, db, primary=False):
         """primary=False なら CLIPBOARD(テキストと画像)、True なら PRIMARY(テキストのみ)を記録する"""
         self.name = "PRIMARY" if primary else "CLIPBOARD"
+        self.db = db
         self.images = not primary
         # ドラッグ中の途中の選択を 1 件ずつ残さないよう、PRIMARY は前の記録と統合する
         self.merge = primary
         self.image_dir = args.image_dir
-        self.text_file = args.primary_file if primary else args.text_file
         self.keep_images = args.keep_images
         self.keep_texts = args.keep_primary if primary else args.keep_texts
         self.delay_ms = args.primary_delay_ms if primary else args.delay_ms
@@ -189,24 +248,34 @@ class Recorder:
         if not text.strip():
             return
         now = int(time.time())
-        texts = load_texts(self.text_file)
-        if self.merge and texts and now - texts[0]["time"] <= self.MERGE_WINDOW_S \
-                and extends(texts[0]["text"], text):
-            texts.pop(0)
-        texts = [t for t in texts if t["text"] != text]
-        texts.insert(0, {"time": now, "text": text})
-        del texts[self.keep_texts:]
-        write_private(self.text_file, json.dumps(texts, ensure_ascii=False).encode("utf-8"))
+        with self.db:
+            if self.merge:
+                last = self.db.execute(
+                    f"SELECT id, time, text FROM entries WHERE selection = ? {ORDER} LIMIT 1",
+                    (self.name,)).fetchone()
+                if last and last[2] is not None and now - last[1] <= self.MERGE_WINDOW_S \
+                        and extends(last[2], text):
+                    self.db.execute("DELETE FROM entries WHERE id = ?", (last[0],))
+            # 同じテキストは新しく記録せず、先頭に移す
+            self.db.execute(
+                "INSERT INTO entries (selection, time, kind, text, hash) VALUES (?, ?, 'text', ?, ?) "
+                "ON CONFLICT (selection, hash) DO UPDATE SET time = excluded.time",
+                (self.name, now, text, text_hash(text)))
+            self.prune("text", self.keep_texts)
         debug(f"{self.name}: テキストを記録 ({len(text)} 文字)")
 
     def save_image(self, data, target):
+        now = int(time.time())
+        digest = data_hash(data)
+        # 同じ画像か、pick で戻した PNG なら、新しく保存せず先頭に移す
+        row = self.db.execute(
+            "SELECT id, path FROM entries WHERE selection = ? AND (hash = ? OR png_hash = ?)",
+            (self.name, digest, digest)).fetchone()
+        if row and Path(row[1]).exists():
+            with self.db:
+                self.db.execute("UPDATE entries SET time = ? WHERE id = ?", (now, row[0]))
+            return
         self.image_dir.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256(data).hexdigest()[:12]
-        if any(self.image_dir.glob(f"*-{digest}.png")):
-            return
-        if target == "image/png" and self.same_png_exists(data):
-            # pick で戻した画像が再び記録されるのを防ぐ
-            return
         path = self.image_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{digest}.png"
         tmp = path.with_suffix(".tmp")
         if target == "image/png":
@@ -217,16 +286,26 @@ class Recorder:
             loader.close()
             loader.get_pixbuf().savev(str(tmp), "png", [], [])
         tmp.rename(path)
+        with self.db:
+            if row:  # ファイルが消えていた古い記録
+                self.db.execute("DELETE FROM entries WHERE id = ?", (row[0],))
+            self.db.execute(
+                "INSERT INTO entries (selection, time, kind, path, hash, png_hash) "
+                "VALUES (?, ?, 'image', ?, ?, ?)",
+                (self.name, now, str(path), digest, data_hash(path.read_bytes())))
+            self.prune("image", self.keep_images)
         log(f"画像を保存: {path} ({target}, {len(data)} bytes)")
-        files = sorted(self.image_dir.glob("*.png"))
-        for old in files[: max(0, len(files) - self.keep_images)]:
-            old.unlink(missing_ok=True)
 
-    def same_png_exists(self, data):
-        for f in self.image_dir.glob("*.png"):
-            if f.stat().st_size == len(data) and f.read_bytes() == data:
-                return True
-        return False
+    def prune(self, kind, keep):
+        """新しいものから keep 件を残して消す。画像はファイルとサムネイルも消す"""
+        old = self.db.execute(
+            f"SELECT id, path FROM entries WHERE selection = ? AND kind = ? {ORDER} LIMIT -1 OFFSET ?",
+            (self.name, kind, keep)).fetchall()
+        for entry_id, path in old:
+            self.db.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+            if path:
+                Path(path).unlink(missing_ok=True)
+                thumb_path(Path(path)).unlink(missing_ok=True)
 
 
 def extends(old, new):
@@ -250,11 +329,13 @@ def run_daemon(args):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         sys.exit("既に起動しています")
-    Recorder(args)
+    db = open_db(args.db)
+    migrate(db, args.image_dir)
+    Recorder(args, db)
     if args.record_primary:
-        Recorder(args, primary=True)
-    log(f"監視開始: DISPLAY={os.environ['DISPLAY']} 画像={args.image_dir} テキスト={args.text_file}"
-        + (f" PRIMARY={args.primary_file}" if args.record_primary else ""))
+        Recorder(args, db, primary=True)
+    log(f"監視開始: DISPLAY={os.environ['DISPLAY']} 画像={args.image_dir} DB={args.db}"
+        + (" PRIMARY も記録" if args.record_primary else ""))
     Gtk.main()
 
 
@@ -278,6 +359,7 @@ MESSAGES = {
         "columns": ["日時", "種類", "内容"],
         "kind_text": "テキスト",
         "kind_image": "画像",
+        "search": "文字を打つと全文から絞り込みます (空白で区切ると AND。画像はファイル名)",
     },
     False: {
         "empty": "Clipboard history is empty",
@@ -289,42 +371,61 @@ MESSAGES = {
         "columns": ["Time", "Type", "Content"],
         "kind_text": "Text",
         "kind_image": "Image",
+        "search": "Type to filter by full text (space-separated words are ANDed; images by file name)",
     },
 }
 
 THUMB_SIZE = (160, 90)  # 一覧のサムネイルの最大の大きさ
-PREVIEW_TEXT_MAX = 20000  # プレビュー欄に出すテキストの最大文字数
+LABEL_CHARS = 400  # 一覧の表示用に DB から読む先頭の文字数(全文はプレビューと貼り付けのときに読む)
+PREVIEW_DELAY_MS = 80  # ↓キーを押し続けたとき、通り過ぎる画像まで読み込まないための待ち時間
 
 
 def preview(text, width=100):
-    one = " ⏎ ".join(line.strip() for line in text.strip().splitlines())
+    head = text.lstrip()[: width * 4]
+    one = " ⏎ ".join(line.strip() for line in head.strip().splitlines())
     return one if len(one) <= width else one[: width - 1] + "…"
 
 
 class Picker:
     """履歴の一覧(画像はサムネイル付き)と、選択中の項目のプレビューを表示する"""
 
-    COL_ID, COL_TIME, COL_KIND, COL_THUMB, COL_LABEL = range(5)
+    COL_ROW, COL_TIME, COL_KIND, COL_LABEL = range(4)
 
-    def __init__(self, entries, msg):
-        self.entries = entries  # (時刻, 種類, 表示, 値)
+    def __init__(self, db, selection, rows, msg):
+        self.db = db
+        self.selection = selection
         self.chosen = None
-        self.store = Gtk.ListStore(int, str, str, GdkPixbuf.Pixbuf, str)
-        for i, (ts, kind, label, _value) in enumerate(entries):
-            when = time.strftime("%m/%d %H:%M", time.localtime(ts))
-            self.store.append([i, when, kind, None, label])
-
+        self.preview_timer = 0
+        self.thumb_timer = 0
+        self.thumbs = {}  # 行番号 → サムネイル
+        self.thumb_queue = []
+        self.rows = [r for r, _ in rows]  # (id, 種類, 画像の Path か None)。一覧の行番号で引く
+        self.row_of = {r[0]: i for i, r in enumerate(self.rows)}  # id → 行番号
+        self.cells = []  # 行番号 → (日時, 種類, 内容の表示)
+        for ts, kind_label, label in (r for _, r in rows):
+            self.cells.append((time.strftime("%m/%d %H:%M", time.localtime(ts)), kind_label, label))
+        # 検索中は、当てはまる行だけの一覧を別に作って差し替える。TreeModelFilter は
+        # 行ごとに Python の判定を呼ぶので、1 万行だと絞り込むたびに 0.5 秒ほどかかった
+        self.all_store = self.make_store(range(len(self.rows)))
+        self.store = self.all_store
         self.view = Gtk.TreeView(model=self.store)
-        self.view.set_search_column(self.COL_LABEL)  # キー入力で内容を検索できる
-        for title, col in ((msg["columns"][0], self.COL_TIME), (msg["columns"][1], self.COL_KIND)):
-            self.view.append_column(Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=col))
+        # TreeView 自身の検索(先頭一致で飛ぶだけ)は使わず、上の検索欄に任せる
+        self.view.set_enable_search(False)
+        # 列の幅は固定する。自動にすると、GTK が全行の幅を測るので行数に比例して遅くなる
+        for title, col, width in ((msg["columns"][0], self.COL_TIME, 100),
+                                  (msg["columns"][1], self.COL_KIND, 80)):
+            column = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=col)
+            column.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+            column.set_fixed_width(width)
+            self.view.append_column(column)
         content = Gtk.TreeViewColumn(msg["columns"][2])
+        content.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+        content.set_expand(True)
         area = content.get_area()
         thumb = Gtk.CellRendererPixbuf(xalign=0)
         # fixed=False にして、サムネイルのないテキストの行は左に詰める
         area.pack_start(thumb, False, False, False)
-        content.add_attribute(thumb, "pixbuf", self.COL_THUMB)
-        content.set_cell_data_func(thumb, self.thumb_visible)
+        content.set_cell_data_func(thumb, self.thumb_cell)
         label = Gtk.CellRendererText()
         area.pack_start(label, True, False, False)
         content.add_attribute(label, "text", self.COL_LABEL)
@@ -343,12 +444,19 @@ class Picker:
 
         list_scroll = Gtk.ScrolledWindow()
         list_scroll.add(self.view)
+        # サムネイルは見えている行の分だけ読み込む
+        list_scroll.get_vadjustment().connect("value-changed", self.queue_visible_thumbs)
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         paned.pack1(list_scroll, True, False)
         paned.pack2(self.stack, True, False)
         paned.set_position(600)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, border_width=6)
         box.pack_start(Gtk.Label(label=msg["text"], xalign=0), False, False, 0)
+        self.search = Gtk.SearchEntry(placeholder_text=msg["search"])
+        self.search.connect("search-changed", self.on_search)
+        self.search.connect("activate", self.activate_cursor)
+        self.search.connect("key-press-event", self.on_search_key)
+        box.pack_start(self.search, False, False, 0)
         box.pack_start(paned, True, True, 0)
 
         self.window = Gtk.Window(title=msg["title"], default_width=1100, default_height=680)
@@ -360,58 +468,179 @@ class Picker:
         self.window.connect("destroy", Gtk.main_quit)
         self.window.show_all()
         self.view.set_cursor(Gtk.TreePath.new_first(), None, False)
-        self.view.grab_focus()
+        # すぐに打ち込めるよう検索欄にフォーカスを置く(↑↓ と Enter は一覧の操作になる)
+        self.search.grab_focus()
         self.window.present()
+        self.queue_visible_thumbs()
 
-        # サムネイルは表示後に 1 枚ずつ読み込み、大きな画像があっても一覧をすぐに出す
-        self.pending_thumbs = [row.iter for row in self.store
-                               if isinstance(entries[row[self.COL_ID]][3], Path)]
-        GLib.idle_add(self.load_next_thumb)
+    def make_store(self, indices):
+        store = Gtk.ListStore(int, str, str, str)
+        columns = [self.COL_ROW, self.COL_TIME, self.COL_KIND, self.COL_LABEL]
+        for i in indices:
+            # append より 5 倍ほど速い(1 万行で 550ms → 100ms)
+            store.insert_with_valuesv(-1, columns, [i, *self.cells[i]])
+        return store
 
-    def thumb_visible(self, _column, cell, model, it, _data):
-        cell.set_visible(isinstance(self.entries[model[it][self.COL_ID]][3], Path))
+    def thumb_cell(self, _column, cell, model, it, _data):
+        i = model[it][self.COL_ROW]
+        image = self.rows[i][2] is not None
+        cell.set_visible(image)
+        # 読み込み前から行の高さをそろえ、読み込んだときに一覧がずれないようにする
+        cell.set_fixed_size(*(THUMB_SIZE if image else (-1, -1)))
+        cell.props.pixbuf = self.thumbs.get(i)
+
+    def queue_visible_thumbs(self, *_args):
+        if not self.thumb_timer:
+            self.thumb_timer = GLib.timeout_add(50, self.load_visible_thumbs)
+
+    def load_visible_thumbs(self):
+        self.thumb_timer = 0
+        visible = self.view.get_visible_range()
+        if not visible:
+            # 行がまだ並んでいない。少し待ってからやり直す
+            self.queue_visible_thumbs()
+            return False
+        first, last = visible[0].get_indices()[0], visible[1].get_indices()[0]
+        # 見えている範囲は、今の一覧での位置。行番号に直して読む
+        shown = [self.store[j][self.COL_ROW] for j in range(first, min(last + 3, len(self.store)))]
+        self.thumb_queue = [(j, i) for j, i in enumerate(shown, first)
+                            if self.rows[i][2] is not None and i not in self.thumbs]
+        if self.thumb_queue:
+            # 既定の優先度だと、GTK が裏で行の高さを測り終えるまで順番が回ってこない
+            GLib.idle_add(self.load_next_thumb, priority=GLib.PRIORITY_HIGH_IDLE)
+        return False
 
     def load_next_thumb(self):
-        if not self.pending_thumbs:
+        if not self.thumb_queue:
             return False
-        it = self.pending_thumbs.pop(0)
-        path = self.entries[self.store[it][self.COL_ID]][3]
+        j, i = self.thumb_queue.pop(0)
+        if i in self.thumbs:
+            return True
+        path = self.rows[i][2]
+        cache = thumb_path(path)
+        pixbuf = None
         try:
-            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), *THUMB_SIZE, True)
-            self.store.set_value(it, self.COL_THUMB, pixbuf)
+            # 大きな画像の縮小は 1 枚 70ms ほどかかるので、一度作ったサムネイルは保存して使い回す
+            if cache.exists():
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(cache))
+            else:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), *THUMB_SIZE, True)
+                cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                tmp = cache.with_suffix(".tmp")
+                pixbuf.savev(str(tmp), "png", [], [])
+                tmp.rename(cache)
         except GLib.Error as e:
             log(f"{path}: サムネイルを作れませんでした: {e.message}")
+        self.thumbs[i] = pixbuf
+        if j < len(self.store) and self.store[j][self.COL_ROW] == i:  # 検索で一覧が変わっていなければ
+            tree_path = Gtk.TreePath.new_from_indices([j])
+            self.store.row_changed(tree_path, self.store.get_iter(tree_path))
         return True
+
+    def full_text(self, i):
+        row = self.db.execute("SELECT text FROM entries WHERE id = ?", (self.rows[i][0],)).fetchone()
+        return row[0] if row else ""
 
     def on_selected(self, selection):
         model, it = selection.get_selected()
         if it is None:
             return
-        value = self.entries[model[it][self.COL_ID]][3]
-        if isinstance(value, Path):
-            alloc = self.stack.get_allocation()
-            w, h = max(alloc.width - 20, 200), max(alloc.height - 20, 200)
-            try:
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(value))
-                # 元の大きさより拡大はしない
-                if pixbuf.get_width() > w or pixbuf.get_height() > h:
-                    pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(value), w, h, True)
-                self.image.set_from_pixbuf(pixbuf)
-            except GLib.Error as e:
-                self.image.clear()
-                log(f"{value}: プレビューを表示できませんでした: {e.message}")
-            self.stack.set_visible_child_name("image")
+        i = model[it][self.COL_ROW]
+        if self.preview_timer:
+            GLib.source_remove(self.preview_timer)
+            self.preview_timer = 0
+        if self.rows[i][2] is not None:
+            self.preview_timer = GLib.timeout_add(PREVIEW_DELAY_MS, self.show_image, self.rows[i][2])
         else:
-            self.text.get_buffer().set_text(value[:PREVIEW_TEXT_MAX])
+            self.text.get_buffer().set_text(self.full_text(i))
             self.stack.set_visible_child_name("text")
 
+    def show_image(self, path):
+        self.preview_timer = 0
+        alloc = self.stack.get_allocation()
+        w, h = max(alloc.width - 20, 200), max(alloc.height - 20, 200)
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(path))
+            # 元の大きさより拡大はしない。読み込みは 1 回だけにして、縮小はメモリ上で行う
+            scale = min(w / pixbuf.get_width(), h / pixbuf.get_height())
+            if scale < 1:
+                pixbuf = pixbuf.scale_simple(max(1, int(pixbuf.get_width() * scale)),
+                                             max(1, int(pixbuf.get_height() * scale)),
+                                             GdkPixbuf.InterpType.BILINEAR)
+            self.image.set_from_pixbuf(pixbuf)
+        except GLib.Error as e:
+            self.image.clear()
+            log(f"{path}: プレビューを表示できませんでした: {e.message}")
+        self.stack.set_visible_child_name("image")
+        return False
+
     def on_activated(self, view, path, _column):
-        self.chosen = self.entries[self.store[path][self.COL_ID]][3]
+        i = self.store[path][self.COL_ROW]
+        self.chosen = self.rows[i][2] or self.full_text(i)
         self.window.destroy()
+
+    def activate_cursor(self, *_args):
+        path, _column = self.view.get_cursor()
+        if path is not None:
+            self.on_activated(self.view, path, None)
+
+    def search_ids(self, words):
+        # 本文は全文を対象にする。lower() は ASCII だけを小文字にするが、日本語には影響しない
+        where = " AND ".join(
+            ["(instr(lower(coalesce(text, '')), ?) > 0 OR instr(lower(coalesce(path, '')), ?) > 0)"]
+            * len(words))
+        params = [self.selection] + [w for word in words for w in (word, word)]
+        return {self.row_of[entry_id] for (entry_id,) in self.db.execute(
+            f"SELECT id FROM entries WHERE selection = ? AND {where}", params)
+            if entry_id in self.row_of}
+
+    def on_search(self, entry):
+        words = entry.get_text().lower().split()
+        if words:
+            matches = self.search_ids(words)
+            self.store = self.make_store(i for i in range(len(self.rows)) if i in matches)
+        else:
+            self.store = self.all_store
+        self.thumb_queue = []
+        self.view.set_model(self.store)
+        if len(self.store):
+            self.view.set_cursor(Gtk.TreePath.new_first(), None, False)
+            self.view.scroll_to_point(0, 0)
+        else:
+            self.image.clear()
+            self.text.get_buffer().set_text("")
+        self.queue_visible_thumbs()
+
+    def on_search_key(self, _entry, event):
+        # 検索欄で ↑↓ や PageUp/PageDown を押したら、一覧のカーソルを動かす
+        steps = {Gdk.KEY_Up: (Gtk.MovementStep.DISPLAY_LINES, -1),
+                 Gdk.KEY_Down: (Gtk.MovementStep.DISPLAY_LINES, 1),
+                 Gdk.KEY_Page_Up: (Gtk.MovementStep.PAGES, -1),
+                 Gdk.KEY_Page_Down: (Gtk.MovementStep.PAGES, 1)}
+        if event.keyval in steps and len(self.store):
+            # move-cursor シグナルは一覧にフォーカスがないと効かないので、位置を計算して動かす
+            path, _column = self.view.get_cursor()
+            row = path.get_indices()[0] if path else 0
+            step, sign = steps[event.keyval]
+            visible = self.view.get_visible_range()
+            page = (visible[1].get_indices()[0] - visible[0].get_indices()[0]) if visible else 10
+            amount = 1 if step == Gtk.MovementStep.DISPLAY_LINES else max(1, page)
+            row = max(0, min(len(self.store) - 1, row + sign * amount))
+            self.view.set_cursor(Gtk.TreePath.new_from_indices([row]), None, False)
+            return True
+        return False
 
     def on_key(self, _window, event):
         if event.keyval == Gdk.KEY_Escape:
-            self.window.destroy()
+            # 検索中なら検索を消す。そうでなければ閉じる
+            if self.search.get_text():
+                self.search.set_text("")
+            else:
+                self.window.destroy()
+            return True
+        # 一覧にフォーカスがあるときに文字を打ったら、検索欄に入れる
+        if not self.search.has_focus() and self.search.handle_event(event):
+            self.search.grab_focus_without_selecting()
             return True
         return False
 
@@ -439,22 +668,25 @@ def run_pick(args):
     if args.primary:
         for key in ("empty", "title", "text"):
             msg[key] = msg[key + "_primary"]
-    entries = []  # (時刻, 種類, 表示, 値)
-    for t in load_texts(args.primary_file if args.primary else args.text_file):
-        entries.append((t["time"], msg["kind_text"], preview(t["text"]), t["text"]))
-    if not args.primary and args.image_dir.is_dir():
-        images = sorted(args.image_dir.glob("*.png"), reverse=True)[: args.pick_images]
-        for f in images:
-            entries.append((f.stat().st_mtime, msg["kind_image"], f.name, f))
-    entries.sort(key=lambda e: e[0], reverse=True)
-    if not entries:
+    db = open_db(args.db)
+    rows = []  # ((id, 種類, Path か None), (時刻, 種類の表示, 内容の表示))
+    for entry_id, ts, kind, head, path in db.execute(
+            f"SELECT id, time, kind, substr(text, 1, {LABEL_CHARS}), path FROM entries "
+            f"WHERE selection = ? {ORDER}", ("PRIMARY" if args.primary else "CLIPBOARD",)):
+        if kind == "image":
+            image = Path(path)
+            if image.exists():  # 手で消された画像は出さない
+                rows.append(((entry_id, kind, image), (ts, msg["kind_image"], image.name)))
+        else:
+            rows.append(((entry_id, kind, None), (ts, msg["kind_text"], preview(head or ""))))
+    if not rows:
         dialog = Gtk.MessageDialog(message_type=Gtk.MessageType.INFO,
                                    buttons=Gtk.ButtonsType.OK, text=msg["empty"])
         dialog.set_keep_above(True)
         dialog.run()
         return
 
-    picker = Picker(entries, msg)
+    picker = Picker(db, "PRIMARY" if args.primary else "CLIPBOARD", rows, msg)
     Gtk.main()
     value = picker.chosen
     if value is None:
@@ -472,20 +704,16 @@ def main():
     p.add_argument("command", nargs="?", default="daemon", choices=["daemon", "pick"])
     p.add_argument("--image-dir", type=Path, default=default_image_dir(),
                    help="画像の保存先 (既定: ピクチャフォルダ/clipboard)")
-    p.add_argument("--text-file", type=Path, default=default_text_file(),
-                   help="テキスト履歴の保存先 (既定: ~/.local/share/clip-history/texts.json)")
-    p.add_argument("--keep-images", type=int, default=300, help="残す画像の枚数 (既定: 300)")
-    p.add_argument("--keep-texts", type=int, default=300, help="残すテキストの件数 (既定: 300)")
+    p.add_argument("--db", type=Path, default=default_db(),
+                   help="履歴の DB (既定: ~/.local/share/clip-history/history.db)")
+    p.add_argument("--keep-images", type=int, default=1000, help="残す画像の枚数 (既定: 1000)")
+    p.add_argument("--keep-texts", type=int, default=10000, help="残すテキストの件数 (既定: 10000)")
     p.add_argument("--primary", action="store_true",
                    help="pick で PRIMARY(マウスで選んだ文字)の履歴を出し、選んだものを PRIMARY に戻す")
-    p.add_argument("--primary-file", type=Path, default=default_primary_file(),
-                   help="PRIMARY の履歴の保存先 (既定: ~/.local/share/clip-history/primary.json)")
-    p.add_argument("--keep-primary", type=int, default=300, help="残す PRIMARY の件数 (既定: 300)")
+    p.add_argument("--keep-primary", type=int, default=10000, help="残す PRIMARY の件数 (既定: 10000)")
     # マウスで選んだ文字はすべて残る(端末のパスワードなども)ので、既定では記録しない
     p.add_argument("--record-primary", action="store_true",
                    help="PRIMARY(マウスで選んだ文字)も別の履歴として記録する")
-    p.add_argument("--pick-images", type=int, default=30,
-                   help="pick の一覧に出す画像の枚数 (既定: 30)")
     p.add_argument("--delay-ms", type=int, default=300,
                    help="所有者変更から取得までの待ち時間 (既定: 300)")
     p.add_argument("--primary-delay-ms", type=int, default=1000,
