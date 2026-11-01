@@ -58,11 +58,15 @@ cd x11-clip-history
 
 - `~/.local/bin/clip-history` から `bin/clip-history` へのシンボリックリンクを作る
 - `~/.config/autostart/clip-history.desktop` を置く
-- `--bind-super-v` を付けると、Super+V に `clip-history pick` を割り当てる(Xfce のみ)
-- `--record-primary` を付けると、PRIMARY も記録するよう自動起動を設定する。`--bind-super-v` と一緒なら、Super+Shift+V に `clip-history pick --primary` を割り当てる
+- `--bind-super-v` を付けると、常駐プロセスが Super+V で `clip-history pick` を開くようにする(`--hotkey Super+V`)。以前の版が Xfce のショートカットに割り当てた Super+V は外す
+- `--record-primary` を付けると、PRIMARY も記録するよう自動起動を設定する。`--bind-super-v` と一緒なら、Super+Shift+V で `clip-history pick --primary` を開く
 - `--start` を付けると、今のセッションで常駐プロセスを起動する
 
-Xfce 以外のデスクトップでは、`~/.local/bin/clip-history pick` を自分でキーに割り当ててください。
+キーは、デスクトップのショートカット設定ではなく、常駐プロセスが X から直接受け付けます。デスクトップ側で同じキーを割り当てていると、そちらが先に反応します(ログに「ほかのプログラムが使っています」と出ます)。常駐プロセスを使わずに、`clip-history pick` をデスクトップのショートカットに割り当てることもできます。その場合、下の tilda の内側に表示する機能は使えません。
+
+### tilda などのドロップダウン端末
+
+tilda の「フォーカスを失ったら隠す」設定を使っていると、デスクトップのショートカットを押した瞬間に tilda が隠れます。X はキーを横取りした瞬間に、tilda に「フォーカスが外れた」と伝えるためです。そこで、前面が tilda のときは、常駐プロセスがキーを tilda のウィンドウ上で受け付け、一覧を tilda の内側に表示します。tilda は隠れず、一覧を閉じるとフォーカスが tilda に戻ります。対象のウィンドウは `--embed-class`(WM_CLASS、既定は `tilda`)で指定します。
 
 ほかのクリップボードマネージャ(clipman、CopyQ など)は、先に止めておいてください。Xfce の clipman の場合は、終了させたうえで、`~/.config/autostart/xfce4-clipman-plugin-autostart.desktop` に `Hidden=true` を設定します。
 

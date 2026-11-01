@@ -15,6 +15,7 @@ xrdp-chansrv は応答待ちの要求を 1 件しか保持できず、要求が�
 PRIMARY はテキストだけを記録する。
 """
 import argparse
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -320,6 +321,283 @@ def lock_path(name):
     return runtime / f"{name}.{display}.lock"
 
 
+# --- Xlib を直接使う部分(ショートカットキーと、tilda の内側への表示) ---
+#
+# tilda のように、フォーカスを失うと隠れる端末から一覧を開くと、端末が隠れてしまう。
+# 隠れるきっかけは 2 つある。
+#   1. デスクトップのショートカット(画面全体への XGrabKey)は、キーを押した瞬間に
+#      フォーカスのあるウィンドウへ FocusOut(mode=NotifyGrab)を送る。GTK はこれを
+#      フォーカスが外れたものとして扱う
+#   2. 一覧がフォーカスを取る
+# そこで、端末が前面にあるときは、キーを端末のウィンドウ上で取り(グラブ先とフォーカスが
+# 同じなので FocusOut が出ない)、一覧は端末のウィンドウの子にしてフォーカスを渡す
+# (子へのフォーカス移動は、端末からはフォーカスが外れたように見えない)。
+
+class XErrorEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("display", ctypes.c_void_p),
+                ("resourceid", ctypes.c_ulong), ("serial", ctypes.c_ulong),
+                ("error_code", ctypes.c_ubyte), ("request_code", ctypes.c_ubyte),
+                ("minor_code", ctypes.c_ubyte)]
+
+
+class XAnyEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+                ("display", ctypes.c_void_p), ("window", ctypes.c_ulong)]
+
+
+class XKeyEvent(ctypes.Structure):
+    _fields_ = XAnyEvent._fields_ + [
+        ("root", ctypes.c_ulong), ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint), ("keycode", ctypes.c_uint), ("same_screen", ctypes.c_int)]
+
+
+class XPropertyEvent(ctypes.Structure):
+    _fields_ = XAnyEvent._fields_ + [("atom", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                                     ("state", ctypes.c_int)]
+
+
+X_KEY_PRESS, X_KEY_RELEASE, X_PROPERTY_NOTIFY = 2, 3, 28
+X_MODIFIERS = {"shift": 1, "control": 4, "ctrl": 4, "alt": 8, "mod1": 8, "super": 64, "mod4": 64}
+X_IGNORED_MODS = (0, 2, 16, 2 | 16)  # CapsLock と NumLock の状態に関係なく反応させる
+X_ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(XErrorEvent))
+
+
+class X11:
+    """GTK とは別の Xlib 接続。エラーは自分の呼び出しの間だけ横取りする
+
+    Xlib のエラーハンドラはプロセスで 1 つなので、GDK のハンドラを置き換えたままにはしない
+    (GDK のハンドラは、知らない接続のエラーを受けるとプロセスを終了させる)。
+    """
+
+    def __init__(self):
+        lib = self.lib = ctypes.CDLL("libX11.so.6")
+        P, W, I, U = ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_uint
+        for name, res, argtypes in (
+                ("XOpenDisplay", P, [ctypes.c_char_p]),
+                ("XDefaultRootWindow", W, [P]),
+                ("XConnectionNumber", I, [P]),
+                ("XInternAtom", W, [P, ctypes.c_char_p, I]),
+                ("XStringToKeysym", W, [ctypes.c_char_p]),
+                ("XKeysymToKeycode", ctypes.c_ubyte, [P, W]),
+                ("XGrabKey", I, [P, I, U, W, I, I, I]),
+                ("XUngrabKey", I, [P, I, U, W]),
+                ("XSelectInput", I, [P, W, ctypes.c_long]),
+                ("XPending", I, [P]),
+                ("XNextEvent", I, [P, P]),
+                ("XSync", I, [P, I]),
+                ("XFlush", I, [P]),
+                ("XGetWindowProperty", I, [P, W, W, ctypes.c_long, ctypes.c_long, I, W,
+                                           ctypes.POINTER(W), ctypes.POINTER(I),
+                                           ctypes.POINTER(ctypes.c_ulong),
+                                           ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(P)]),
+                ("XFree", I, [P]),
+                ("XReparentWindow", I, [P, W, W, I, I]),
+                ("XSetInputFocus", I, [P, W, I, W]),
+                ("XGetGeometry", I, [P, W, ctypes.POINTER(W), ctypes.POINTER(I), ctypes.POINTER(I),
+                                     ctypes.POINTER(U), ctypes.POINTER(U), ctypes.POINTER(U),
+                                     ctypes.POINTER(U)]),
+                ("XkbSetDetectableAutoRepeat", I, [P, I, P]),
+                ("XSetErrorHandler", P, [P])):
+            fn = getattr(lib, name)
+            fn.restype, fn.argtypes = res, argtypes
+        self.dpy = lib.XOpenDisplay(None)
+        if not self.dpy:
+            raise RuntimeError("X に接続できません")
+        self.root = lib.XDefaultRootWindow(self.dpy)
+        self.errors = []
+        self._handler = X_ERROR_HANDLER(self._on_error)  # GC されないよう保持する
+
+    def _on_error(self, _dpy, ev):
+        e = ev.contents
+        self.errors.append((e.error_code, e.request_code, e.resourceid))
+        return 0
+
+    def call(self, name, *args):
+        """Xlib の関数を呼び、同期してエラーを集める"""
+        old = self.lib.XSetErrorHandler(ctypes.cast(self._handler, ctypes.c_void_p))
+        try:
+            result = getattr(self.lib, name)(self.dpy, *args)
+            self.lib.XSync(self.dpy, 0)
+        finally:
+            self.lib.XSetErrorHandler(old)
+        return result
+
+    def take_errors(self):
+        errors, self.errors = self.errors, []
+        return errors
+
+    def atom(self, name):
+        return self.lib.XInternAtom(self.dpy, name.encode(), 0)
+
+    def property(self, window, name, fmt_type):
+        """ウィンドウのプロパティを (形式, バイト列) で返す。なければ None"""
+        actual, fmt = ctypes.c_ulong(), ctypes.c_int()
+        n, after, data = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
+        status = self.call("XGetWindowProperty", window, self.atom(name), 0, 1024, 0, fmt_type,
+                           ctypes.byref(actual), ctypes.byref(fmt), ctypes.byref(n),
+                           ctypes.byref(after), ctypes.byref(data))
+        if self.take_errors() or status != 0 or not data.value:
+            return None
+        try:
+            size = {8: 1, 16: ctypes.sizeof(ctypes.c_short), 32: ctypes.sizeof(ctypes.c_long)}[fmt.value]
+            return fmt.value, ctypes.string_at(data.value, size * n.value)
+        finally:
+            self.lib.XFree(data)
+
+    def active_window(self):
+        prop = self.property(self.root, "_NET_ACTIVE_WINDOW", 33)  # XA_WINDOW
+        if not prop or len(prop[1]) < ctypes.sizeof(ctypes.c_ulong):
+            return 0
+        return ctypes.c_ulong.from_buffer_copy(prop[1][:ctypes.sizeof(ctypes.c_ulong)]).value
+
+    def wm_class(self, window):
+        prop = self.property(window, "WM_CLASS", 31)  # XA_STRING
+        if not prop:
+            return []
+        return [s.decode("latin-1").lower() for s in prop[1].split(b"\0") if s]
+
+    def geometry(self, window):
+        root, x, y = ctypes.c_ulong(), ctypes.c_int(), ctypes.c_int()
+        w, h, border, depth = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+        ok = self.call("XGetGeometry", window, ctypes.byref(root), ctypes.byref(x), ctypes.byref(y),
+                       ctypes.byref(w), ctypes.byref(h), ctypes.byref(border), ctypes.byref(depth))
+        if self.take_errors() or not ok:
+            return None
+        return w.value, h.value
+
+
+def parse_hotkey(spec, x):
+    """"Super+V" のような指定を (修飾キー, キーコード) にする"""
+    *mods, key = [part.strip() for part in spec.split("+")]
+    mask = 0
+    for mod in mods:
+        if mod.lower() not in X_MODIFIERS:
+            raise ValueError(f"知らない修飾キーです: {mod}")
+        mask |= X_MODIFIERS[mod.lower()]
+    keysym = x.lib.XStringToKeysym(key.encode()) or x.lib.XStringToKeysym(key.lower().encode())
+    keycode = x.lib.XKeysymToKeycode(x.dpy, keysym) if keysym else 0
+    if not keycode:
+        raise ValueError(f"知らないキーです: {key}")
+    return mask, keycode
+
+
+class Hotkeys:
+    """ショートカットキーを受け付けて pick を起動する
+
+    普段は画面全体(ルートウィンドウ)でキーを取る。--embed-class に当てはまるウィンドウ
+    (既定は tilda)が前面にあるときは、そのウィンドウ上でキーを取り、一覧をその内側に出す。
+    ルートで取ったままだと、そちらが先に反応してしまうので、その間はルートでは取らない。
+    """
+
+    def __init__(self, args, bindings):
+        self.x = X11()
+        self.args = args
+        self.embed_classes = {c.strip().lower() for c in args.embed_class.split(",") if c.strip()}
+        self.keys = {}  # (修飾キー, キーコード) → pick に渡す追加の引数
+        for spec, extra in bindings:
+            self.keys[parse_hotkey(spec, self.x)] = (spec, extra)
+        self.grabbed = None  # キーを取っているウィンドウ
+        self.embed = False
+        self.down = set()
+        self.net_active = self.x.atom("_NET_ACTIVE_WINDOW")
+        # キーを押し続けたときの自動リピートで、開閉を繰り返さないようにする
+        self.x.call("XkbSetDetectableAutoRepeat", 1, None)
+        self.x.call("XSelectInput", self.x.root, 1 << 22)  # PropertyChangeMask
+        self.update_grab()
+        GLib.io_add_watch(self.x.lib.XConnectionNumber(self.x.dpy), GLib.IO_IN, self.on_events)
+        log("ショートカット: " + ", ".join(spec for spec, _ in self.keys.values())
+            + (f"(前面が {args.embed_class} のときは、その内側に表示)" if self.embed_classes else ""))
+
+    def grab(self, window, on):
+        for (mask, keycode), (spec, _) in self.keys.items():
+            for extra in X_IGNORED_MODS:
+                if on:
+                    self.x.call("XGrabKey", keycode, mask | extra, window, 0, 1, 1)  # GrabModeAsync
+                else:
+                    self.x.call("XUngrabKey", keycode, mask | extra, window)
+            errors = self.x.take_errors()
+            # BadAccess(10): ほかのプログラム(デスクトップのショートカット設定など)が取っている
+            if on and any(code == 10 for code, _, _ in errors):
+                log(f"{spec} はほかのプログラムが使っています。デスクトップのショートカット設定から外してください")
+            elif errors:
+                debug(f"{spec}: X のエラー {errors}")
+
+    def update_grab(self):
+        active = self.x.active_window()
+        embed = bool(active) and bool(self.embed_classes & set(self.x.wm_class(active)))
+        target = active if embed else self.x.root
+        if target == self.grabbed:
+            return
+        if self.grabbed is not None:
+            self.grab(self.grabbed, False)
+        self.grab(target, True)
+        self.grabbed, self.embed = target, embed
+        debug(f"キーを取るウィンドウ: {target:#x}" + (" (内側に表示)" if embed else ""))
+
+    def on_events(self, *_args):
+        ev = ctypes.create_string_buffer(192)  # sizeof(XEvent)
+        while self.x.call("XPending"):
+            self.x.call("XNextEvent", ev)
+            kind = XAnyEvent.from_buffer(ev).type
+            if kind == X_PROPERTY_NOTIFY and XPropertyEvent.from_buffer(ev).atom == self.net_active:
+                self.update_grab()
+            elif kind in (X_KEY_PRESS, X_KEY_RELEASE):
+                key = XKeyEvent.from_buffer(ev)
+                if kind == X_KEY_RELEASE:
+                    self.down.discard(key.keycode)
+                    continue
+                if key.keycode in self.down:
+                    continue
+                self.down.add(key.keycode)
+                mask = key.state & ~(2 | 16)
+                for (want_mask, keycode), (_spec, extra) in self.keys.items():
+                    if keycode == key.keycode and want_mask == mask:
+                        self.launch(extra)
+        self.x.take_errors()
+        return True
+
+    def launch(self, extra):
+        argv = [sys.executable, os.path.abspath(sys.argv[0]), "pick", *extra,
+                "--db", str(self.args.db)]
+        if self.embed:
+            argv += ["--embed", str(self.grabbed)]
+        debug(f"起動: {argv}")
+        # 終わった子プロセスは GLib が片付ける
+        GLib.spawn_async(argv, flags=GLib.SpawnFlags.DEFAULT)
+
+
+class Embedder:
+    """pick の一覧を、指定のウィンドウ(tilda など)の内側に表示する"""
+
+    def __init__(self, window, parent):
+        self.x = X11()
+        self.window, self.parent = window, parent
+
+    def place(self, width, height):
+        """表示する前に呼ぶ。大きさを親に合わせて決め、親の子にする"""
+        size = self.x.geometry(self.parent)
+        if size is None:
+            return False
+        pw, ph = size
+        width, height = min(width, pw - 40), min(height, ph - 40)
+        self.window.set_size_request(max(width, 300), max(height, 200))
+        self.window.realize()
+        xid = self.window.get_window().get_xid()
+        self.x.call("XReparentWindow", xid, self.parent, max(0, (pw - width) // 2), max(0, (ph - height) // 2))
+        if self.x.take_errors():
+            return False
+        self.window.connect("map-event", lambda *_: self.focus(xid))
+        self.window.connect("destroy", lambda *_: self.focus(self.parent))
+        return True
+
+    def focus(self, xid):
+        # RevertToParent(2): 一覧が消えたら、フォーカスは親(tilda)に戻る
+        self.x.call("XSetInputFocus", xid, 2, 0)
+        self.x.take_errors()
+        return False
+
+
 def run_daemon(args):
     if not os.environ.get("DISPLAY"):
         sys.exit("DISPLAY が未設定です")
@@ -334,6 +612,13 @@ def run_daemon(args):
     Recorder(args, db)
     if args.record_primary:
         Recorder(args, db, primary=True)
+    bindings = [(spec, extra) for spec, extra in ((args.hotkey, []), (args.primary_hotkey, ["--primary"]))
+                if spec]
+    if bindings:
+        try:
+            Hotkeys(args, bindings)
+        except (RuntimeError, ValueError) as e:
+            log(f"ショートカットを使えません: {e}")
     log(f"監視開始: DISPLAY={os.environ['DISPLAY']} 画像={args.image_dir} DB={args.db}"
         + (" PRIMARY も記録" if args.record_primary else ""))
     Gtk.main()
@@ -391,7 +676,7 @@ class Picker:
 
     COL_ROW, COL_TIME, COL_KIND, COL_LABEL = range(4)
 
-    def __init__(self, db, selection, rows, msg):
+    def __init__(self, db, selection, rows, msg, embed=None):
         self.db = db
         self.selection = selection
         self.chosen = None
@@ -459,10 +744,21 @@ class Picker:
         box.pack_start(self.search, False, False, 0)
         box.pack_start(paned, True, True, 0)
 
-        self.window = Gtk.Window(title=msg["title"], default_width=1100, default_height=680)
-        self.window.set_position(Gtk.WindowPosition.CENTER)
-        self.window.set_type_hint(Gdk.WindowTypeHint.DIALOG)
-        self.window.set_keep_above(True)
+        embedder = None
+        if embed:
+            # tilda などの内側に出す。ウィンドウマネージャを通さない窓にして、親の子にする
+            self.window = Gtk.Window(type=Gtk.WindowType.POPUP)
+            embedder = Embedder(self.window, embed)
+            if not embedder.place(1100, 680):
+                log(f"{embed:#x} の内側に表示できませんでした。普通のウィンドウで表示します")
+                self.window.destroy()
+                embedder = None
+        if embedder is None:
+            self.window = Gtk.Window(title=msg["title"], default_width=1100, default_height=680)
+            self.window.set_position(Gtk.WindowPosition.CENTER)
+            self.window.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+            self.window.set_keep_above(True)
+        self.embedder = embedder  # 一覧を閉じるまで X の接続を保つ
         self.window.add(box)
         self.window.connect("key-press-event", self.on_key)
         self.window.connect("destroy", Gtk.main_quit)
@@ -686,7 +982,7 @@ def run_pick(args):
         dialog.run()
         return
 
-    picker = Picker(db, "PRIMARY" if args.primary else "CLIPBOARD", rows, msg)
+    picker = Picker(db, "PRIMARY" if args.primary else "CLIPBOARD", rows, msg, embed=args.embed)
     Gtk.main()
     value = picker.chosen
     if value is None:
@@ -722,6 +1018,15 @@ def main():
                    help="これより大きい画像は保存しない (既定: 64)")
     p.add_argument("--max-text-kb", type=int, default=1024,
                    help="これより大きいテキストは保存しない (既定: 1024)")
+    p.add_argument("--hotkey", metavar="KEY",
+                   help="常駐プロセスがこのキー(例: Super+V)で pick を開く。"
+                        "デスクトップのショートカット設定の代わりに使う")
+    p.add_argument("--primary-hotkey", metavar="KEY",
+                   help="常駐プロセスがこのキー(例: Super+Shift+V)で pick --primary を開く")
+    p.add_argument("--embed-class", default="tilda",
+                   help="--hotkey を押したとき、前面がこの WM_CLASS のウィンドウなら、一覧をその内側に"
+                        "出す。フォーカスを失うと隠れる端末のため。カンマ区切りで複数、空で無効 (既定: tilda)")
+    p.add_argument("--embed", type=lambda v: int(v, 0), help=argparse.SUPPRESS)  # 常駐プロセスが pick に渡す
     p.add_argument("-v", "--verbose", action="store_true", help="イベントごとの詳細ログを出す")
     args = p.parse_args()
     global DEBUG

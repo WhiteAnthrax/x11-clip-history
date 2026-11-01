@@ -58,11 +58,15 @@ cd x11-clip-history
 
 - symlinks `~/.local/bin/clip-history` to `bin/clip-history`
 - installs `~/.config/autostart/clip-history.desktop`
-- with `--bind-super-v`, binds Super+V to `clip-history pick` (Xfce only)
-- with `--record-primary`, makes the autostart entry record PRIMARY too; together with `--bind-super-v`, also binds Super+Shift+V to `clip-history pick --primary`
+- with `--bind-super-v`, makes the daemon open `clip-history pick` on Super+V (`--hotkey Super+V`), and removes the Xfce Super+V shortcut set by earlier versions
+- with `--record-primary`, makes the autostart entry record PRIMARY too; together with `--bind-super-v`, Super+Shift+V opens `clip-history pick --primary`
 - with `--start`, starts the daemon in the current session
 
-On other desktops, bind `~/.local/bin/clip-history pick` to a key yourself.
+The daemon grabs the key directly from X instead of using the desktop's shortcut settings. If the desktop binds the same key, it wins (the log says the key is used by another program). You can still bind `clip-history pick` in the desktop's shortcut settings instead, but then the tilda support below does not work.
+
+### Drop-down terminals such as tilda
+
+With tilda's "hide when focus is lost" option, pressing a desktop shortcut hides tilda immediately, because X tells tilda that it lost focus as soon as the key grab activates. So when tilda is the active window, the daemon grabs the key on tilda's own window and shows the list inside tilda. tilda stays visible, and focus returns to it when the list closes. The window class is set with `--embed-class` (WM_CLASS, default `tilda`).
 
 Stop other clipboard managers (clipman, CopyQ, etc.) first. For clipman on Xfce, quit it and set `Hidden=true` in `~/.config/autostart/xfce4-clipman-plugin-autostart.desktop`.
 
