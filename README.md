@@ -60,6 +60,7 @@ cd x11-clip-history
 - installs `~/.config/autostart/clip-history.desktop`
 - with `--bind-super-v`, makes the daemon open `clip-history pick` on Super+V (`--hotkey Super+V`), and removes the Xfce Super+V shortcut set by earlier versions
 - with `--record-primary`, makes the autostart entry record PRIMARY too; together with `--bind-super-v`, Super+Shift+V opens `clip-history pick --primary`
+- with `--yakuake-keep-open-key KEY` together with `--bind-super-v`, keeps Yakuake open while the list is open (see "Drop-down terminals such as tilda" below)
 - with `--start`, starts the daemon in the current session
 
 The daemon grabs the key directly from X instead of using the desktop's shortcut settings. If the desktop binds the same key, it wins (the log says the key is used by another program). You can still bind `clip-history pick` in the desktop's shortcut settings instead, but then the tilda support below does not work.

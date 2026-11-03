@@ -5,11 +5,13 @@
 #   (--bind-super-v 指定時) 常駐プロセスが Super+V で "clip-history pick" を開く
 #   (--record-primary 指定時) PRIMARY も記録する。--bind-super-v と一緒なら
 #   Super+Shift+V で "clip-history pick --primary" を開く
+#   (--yakuake-keep-open-key 指定時) 前面が Yakuake のとき、一覧を開いている間だけ
+#   Yakuake を「フォーカスを失っても開いたまま」にする
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: install.sh [--bind-super-v] [--record-primary] [--start] [--dry-run]
+usage: install.sh [--bind-super-v] [--record-primary] [--yakuake-keep-open-key KEY] [--start] [--dry-run]
        install.sh --uninstall [--dry-run]
 
   --bind-super-v    常駐プロセスが Super+V で "clip-history pick" を開くようにする。
@@ -17,6 +19,10 @@ usage: install.sh [--bind-super-v] [--record-primary] [--start] [--dry-run]
                     (Xfce 側で取っていると、tilda の内側に一覧を出せないため)
   --record-primary  PRIMARY(マウスで選んだ文字)も記録する。--bind-super-v と一緒なら
                     Super+Shift+V で "clip-history pick --primary" を開く
+  --yakuake-keep-open-key KEY
+                    --bind-super-v と一緒に使う。前面が Yakuake のとき、一覧を開いている間だけ
+                    Yakuake を「フォーカスを失ってもウィンドウを開いたままにする」にする。
+                    KEY は Yakuake でその操作に割り当てたキー(例: Ctrl+Alt+Shift+K)
   --start         インストール後、このセッションで常駐プロセスを起動する
   --uninstall     シンボリックリンクと自動起動設定を削除し、常駐プロセスを止める
   --dry-run       実行する内容を表示するだけで、何も変更しない
@@ -33,18 +39,27 @@ autostart="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/clip-history.desktop"
 shortcut='/commands/custom/<Super>v'
 shortcut_primary='/commands/custom/<Shift><Super>v'
 
-bind=0 record_primary=0 start=0 uninstall=0 dry_run=0
-for arg in "$@"; do
-  case $arg in
+bind=0 record_primary=0 start=0 uninstall=0 dry_run=0 yakuake_key=
+while [[ $# -gt 0 ]]; do
+  case $1 in
     --bind-super-v) bind=1 ;;
     --record-primary) record_primary=1 ;;
+    --yakuake-keep-open-key)
+      [[ $# -ge 2 ]] || die "--yakuake-keep-open-key にはキーを指定してください (例: Ctrl+Alt+Shift+K)"
+      yakuake_key=$2; shift ;;
     --start) start=1 ;;
     --uninstall) uninstall=1 ;;
     --dry-run) dry_run=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 1 ;;
   esac
+  shift
 done
+if [[ -n $yakuake_key ]]; then
+  [[ $bind == 1 ]] || die "--yakuake-keep-open-key は --bind-super-v と一緒に指定してください"
+  # 自動起動の設定ファイルにそのまま書くので、キーの名前に使う文字だけを通す
+  [[ $yakuake_key =~ ^[A-Za-z0-9_+]+$ ]] || die "キーの指定に使えない文字があります: $yakuake_key"
+fi
 
 stop_daemon() {
   local pids
@@ -95,6 +110,7 @@ fi
 if [[ $bind == 1 ]]; then
   daemon_args+=(--hotkey Super+V)
   [[ $record_primary == 1 ]] && daemon_args+=(--primary-hotkey Super+Shift+V)
+  [[ -n $yakuake_key ]] && daemon_args+=(--yakuake-keep-open-key "$yakuake_key")
   log "ショートカットを常駐プロセスで受け付けるよう自動起動を設定: ${daemon_args[*]}"
 fi
 if [[ ${#daemon_args[@]} -gt 0 ]]; then

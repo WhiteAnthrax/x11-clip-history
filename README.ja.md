@@ -60,6 +60,7 @@ cd x11-clip-history
 - `~/.config/autostart/clip-history.desktop` を置く
 - `--bind-super-v` を付けると、常駐プロセスが Super+V で `clip-history pick` を開くようにする(`--hotkey Super+V`)。以前の版が Xfce のショートカットに割り当てた Super+V は外す
 - `--record-primary` を付けると、PRIMARY も記録するよう自動起動を設定する。`--bind-super-v` と一緒なら、Super+Shift+V で `clip-history pick --primary` を開く
+- `--yakuake-keep-open-key KEY` を `--bind-super-v` と一緒に付けると、前面が Yakuake のとき、一覧を開いている間だけ Yakuake を引っ込まない設定にする(下の「tilda などのドロップダウン端末」を参照)
 - `--start` を付けると、今のセッションで常駐プロセスを起動する
 
 キーは、デスクトップのショートカット設定ではなく、常駐プロセスが X から直接受け付けます。デスクトップ側で同じキーを割り当てていると、そちらが先に反応します(ログに「ほかのプログラムが使っています」と出ます)。常駐プロセスを使わずに、`clip-history pick` をデスクトップのショートカットに割り当てることもできます。その場合、下の tilda の内側に表示する機能は使えません。
