@@ -68,6 +68,8 @@ The daemon grabs the key directly from X instead of using the desktop's shortcut
 
 With tilda's "hide when focus is lost" option, pressing a desktop shortcut hides tilda immediately, because X tells tilda that it lost focus as soon as the key grab activates. So when tilda is the active window, the daemon grabs the key on tilda's own window and shows the list inside tilda. tilda stays visible, and focus returns to it when the list closes. The window class is set with `--embed-class` (WM_CLASS, default `tilda`).
 
+Yakuake hides even when focus moves to a list shown inside it, so this does not work there. Instead, the daemon turns on Yakuake's "Keep window open when it loses focus" while the list is open. That action is not available over D-Bus, so assign a key to it in Yakuake's "Configure Keyboard Shortcuts" and pass the same key with `--yakuake-keep-open-key` (e.g. `--yakuake-keep-open-key Ctrl+Alt+Shift+K`). The daemon sends that key to switch it on, and when the list closes it brings Yakuake back to the front and switches it off again.
+
 Stop other clipboard managers (clipman, CopyQ, etc.) first. For clipman on Xfce, quit it and set `Hidden=true` in `~/.config/autostart/xfce4-clipman-plugin-autostart.desktop`.
 
 Uninstall with `./install.sh --uninstall`. History data is kept.

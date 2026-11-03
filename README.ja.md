@@ -68,6 +68,8 @@ cd x11-clip-history
 
 tilda の「フォーカスを失ったら隠す」設定を使っていると、デスクトップのショートカットを押した瞬間に tilda が隠れます。X はキーを横取りした瞬間に、tilda に「フォーカスが外れた」と伝えるためです。そこで、前面が tilda のときは、常駐プロセスがキーを tilda のウィンドウ上で受け付け、一覧を tilda の内側に表示します。tilda は隠れず、一覧を閉じるとフォーカスが tilda に戻ります。対象のウィンドウは `--embed-class`(WM_CLASS、既定は `tilda`)で指定します。
 
+Yakuake は、内側に表示した一覧にフォーカスが移っただけでも隠れるので、この方法は使えません。代わりに、一覧を開いている間だけ Yakuake を「フォーカスを失ってもウィンドウを開いたままにする」に切り替えます。この切り替えは D-Bus から操作できないので、Yakuake の「キーボードショートカットを設定」でこの操作にキーを割り当て、同じキーを `--yakuake-keep-open-key` に指定してください(例: `--yakuake-keep-open-key Ctrl+Alt+Shift+K`)。常駐プロセスがそのキーを送って切り替え、一覧を閉じたら Yakuake を前面に戻してから元に戻します。
+
 ほかのクリップボードマネージャ(clipman、CopyQ など)は、先に止めておいてください。Xfce の clipman の場合は、終了させたうえで、`~/.config/autostart/xfce4-clipman-plugin-autostart.desktop` に `Hidden=true` を設定します。
 
 アンインストールは `./install.sh --uninstall` で行います。履歴のデータは消さずに残します。

@@ -357,8 +357,19 @@ class XPropertyEvent(ctypes.Structure):
                                      ("state", ctypes.c_int)]
 
 
-X_KEY_PRESS, X_KEY_RELEASE, X_PROPERTY_NOTIFY = 2, 3, 28
+class XModifierKeymap(ctypes.Structure):
+    _fields_ = [("max_keypermod", ctypes.c_int), ("modifiermap", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+class XClientMessageEvent(ctypes.Structure):
+    _fields_ = XAnyEvent._fields_ + [("message_type", ctypes.c_ulong), ("format", ctypes.c_int),
+                                     ("data", ctypes.c_long * 5)]
+
+
+X_KEY_PRESS, X_KEY_RELEASE, X_PROPERTY_NOTIFY, X_CLIENT_MESSAGE = 2, 3, 28, 33
 X_MODIFIERS = {"shift": 1, "control": 4, "ctrl": 4, "alt": 8, "mod1": 8, "super": 64, "mod4": 64}
+# XTEST で修飾キーを押すときに使うキー
+X_MODIFIER_KEYSYMS = {1: b"Shift_L", 4: b"Control_L", 8: b"Alt_L", 64: b"Super_L"}
 X_IGNORED_MODS = (0, 2, 16, 2 | 16)  # CapsLock と NumLock の状態に関係なく反応させる
 X_ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(XErrorEvent))
 
@@ -398,6 +409,13 @@ class X11:
                                      ctypes.POINTER(U), ctypes.POINTER(U), ctypes.POINTER(U),
                                      ctypes.POINTER(U)]),
                 ("XkbSetDetectableAutoRepeat", I, [P, I, P]),
+                ("XQueryPointer", I, [P, W, ctypes.POINTER(W), ctypes.POINTER(W),
+                                      ctypes.POINTER(I), ctypes.POINTER(I), ctypes.POINTER(I),
+                                      ctypes.POINTER(I), ctypes.POINTER(U)]),
+                ("XSendEvent", I, [P, W, I, ctypes.c_long, P]),
+                ("XQueryKeymap", I, [P, ctypes.c_char_p]),
+                ("XGetModifierMapping", ctypes.POINTER(XModifierKeymap), [P]),
+                ("XFreeModifiermap", I, [ctypes.POINTER(XModifierKeymap)]),
                 ("XSetErrorHandler", P, [P])):
             fn = getattr(lib, name)
             fn.restype, fn.argtypes = res, argtypes
@@ -466,6 +484,64 @@ class X11:
             return None
         return w.value, h.value
 
+    def modifier_state(self):
+        """今押されている修飾キー(X の state のビット)"""
+        root, child, mask = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_uint()
+        rx, ry, wx, wy = ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        self.call("XQueryPointer", self.root, ctypes.byref(root), ctypes.byref(child), ctypes.byref(rx),
+                  ctypes.byref(ry), ctypes.byref(wx), ctypes.byref(wy), ctypes.byref(mask))
+        self.take_errors()
+        return mask.value & (1 | 4 | 8 | 64)
+
+    def xtest(self, keycode, press):
+        xtst = ctypes.CDLL("libXtst.so.6")
+        xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        xtst.XTestFakeKeyEvent(self.dpy, keycode, 1 if press else 0, 0)
+
+    def send_key(self, mask, keycode):
+        """修飾キーと一緒にキーを押して離す(XTEST)。届く先はフォーカスのあるウィンドウ"""
+        mods = [self.lib.XKeysymToKeycode(self.dpy, self.lib.XStringToKeysym(sym))
+                for bit, sym in X_MODIFIER_KEYSYMS.items() if mask & bit]
+        for code in mods + [keycode]:
+            self.xtest(code, True)
+        for code in [keycode] + mods[::-1]:
+            self.xtest(code, False)
+        self.call("XFlush")
+        self.take_errors()
+
+    def release_modifiers(self):
+        """押されたままの Shift・Ctrl・Alt・Super を、離したことにする(XTEST)
+
+        ショートカットの Super を押したままだと、送るキーと組み合わさってしまうため。
+        あとで本物の Super を離しても、既に離れているので何も起きない。
+        """
+        keys = ctypes.create_string_buffer(32)
+        self.call("XQueryKeymap", keys)
+        modmap = self.lib.XGetModifierMapping(self.dpy)
+        try:
+            per = modmap.contents.max_keypermod
+            # 修飾キーの表の行: 0=Shift 2=Control 3=Mod1(Alt) 6=Mod4(Super)
+            codes = {modmap.contents.modifiermap[row * per + i] for row in (0, 2, 3, 6) for i in range(per)}
+        finally:
+            self.lib.XFreeModifiermap(modmap)
+        held = [c for c in codes if c and keys.raw[c // 8] & (1 << (c % 8))]
+        for code in held:
+            self.xtest(code, False)
+        self.call("XFlush")
+        self.take_errors()
+        return held
+
+    def activate(self, window):
+        """ウィンドウマネージャに、ウィンドウを前面にしてフォーカスを渡すよう頼む"""
+        buf = ctypes.create_string_buffer(192)  # sizeof(XEvent)
+        ev = XClientMessageEvent.from_buffer(buf)
+        ev.type, ev.send_event, ev.display, ev.window = X_CLIENT_MESSAGE, 1, self.dpy, window
+        ev.message_type, ev.format = self.atom("_NET_ACTIVE_WINDOW"), 32
+        ev.data[0] = 2  # 要求元はページャ扱い(フォーカスを奪う防止に止められないように)
+        # SubstructureRedirectMask | SubstructureNotifyMask
+        self.call("XSendEvent", self.root, 0, (1 << 20) | (1 << 19), buf)
+        self.take_errors()
+
 
 def parse_hotkey(spec, x):
     """"Super+V" のような指定を (修飾キー, キーコード) にする"""
@@ -482,12 +558,108 @@ def parse_hotkey(spec, x):
     return mask, keycode
 
 
+class YakuakeKeepOpen:
+    """一覧を開いている間だけ、Yakuake を「フォーカスを失っても引っ込まない」にする
+
+    Yakuake は、自分のウィンドウからフォーカスが外れると引っ込む。tilda と違い、内側に
+    出した子の窓にフォーカスを移しても引っ込むので、内側に出す方法は使えない。
+    この切り替えは D-Bus に出ていないため、Yakuake 側で割り当てたキーを XTEST で送る。
+    切り替えると Yakuake は yakuakerc の [Window] KeepOpen をすぐ書き換えるので、
+    それを読んで切り替わったかを確かめる。
+    戻せなかったときは印のファイルを残し、次に Yakuake が前面になったときに戻す。
+    """
+
+    WAIT_S = 1.5  # 修飾キーが離されるのと、yakuakerc が書き換わるのを待つ上限
+
+    def __init__(self, x, key_spec):
+        self.x = x
+        self.key = parse_hotkey(key_spec, x)
+        self.config = Path(GLib.get_user_config_dir()) / "yakuakerc"
+        self.mark = lock_path("clip-history-yakuake-keep-open")  # 戻し待ちの印
+
+    def keep_open(self):
+        """yakuakerc の [Window] KeepOpen。読めなければ None
+
+        KDE の設定は既定値と同じ値を書かずに行ごと消す。KeepOpen の既定は true なので、
+        行がなければ true(引っ込まない)、false のときだけ行が書かれる。
+        """
+        try:
+            lines = self.config.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        section = None
+        for line in lines:
+            line = line.strip()
+            if line.startswith("["):
+                section = line
+            elif section == "[Window]" and line.startswith("KeepOpen="):
+                return line.split("=", 1)[1].strip().lower() == "true"
+        return True
+
+    def wait(self, check, seconds=None):
+        end = time.monotonic() + (self.WAIT_S if seconds is None else seconds)
+        while time.monotonic() < end:
+            if check():
+                return True
+            time.sleep(0.05)
+        return check()
+
+    def toggle(self, want):
+        """キーを送り、KeepOpen が want になったかを返す"""
+        # ショートカットの Super などが押されたままだと、送ったキーと組み合わさってしまう。
+        # 手で押すと Super(Mac の Cmd)を離すまで 1 秒以上かかることがあるので、少し待っても
+        # 離されなければ、離したことにする
+        released = lambda: self.x.modifier_state() == 0  # noqa: E731
+        if not self.wait(released, 0.3):
+            held = self.x.release_modifiers()
+            debug(f"Yakuake: 押されたままの修飾キーを離したことにしました: {held}")
+            if not self.wait(released, 0.5):
+                log("Yakuake: 修飾キーが押されたままなので、切り替えのキーを送りません")
+                return False
+        self.x.send_key(*self.key)
+        return self.wait(lambda: self.keep_open() == want)
+
+    def before_pick(self):
+        """一覧を開く前に呼ぶ。前面は Yakuake であること"""
+        if self.mark.exists():
+            return  # 前回から引っ込まない設定のまま
+        state = self.keep_open()
+        if state is None or state:
+            return  # 読めない、または利用者が自分で引っ込まない設定にしている
+        if self.toggle(True):
+            self.mark.touch()
+        else:
+            log(f"Yakuake: 引っ込まない設定に切り替わりませんでした。{self.config} の KeepOpen と、"
+                "Yakuake のショートカット設定を確かめてください")
+
+    def restore(self, window):
+        """引っ込まない設定を戻す。window は Yakuake のウィンドウ。戻せたら True"""
+        if not self.mark.exists():
+            return True
+        if self.keep_open() is False:  # 利用者が手で戻した
+            self.mark.unlink(missing_ok=True)
+            return True
+        # キーはフォーカスのあるウィンドウに届くので、Yakuake を前面にしてから送る
+        if self.x.active_window() != window:
+            self.x.activate(window)
+            if not self.wait(lambda: self.x.active_window() == window):
+                log("Yakuake: 前面に戻せないので、引っ込まない設定のままにします(次に前面になったときに戻します)")
+                return False
+        if self.toggle(False):
+            self.mark.unlink(missing_ok=True)
+            return True
+        log("Yakuake: 引っ込まない設定を戻せませんでした(次に前面になったときにやり直します)")
+        return False
+
+
 class Hotkeys:
     """ショートカットキーを受け付けて pick を起動する
 
     普段は画面全体(ルートウィンドウ)でキーを取る。--embed-class に当てはまるウィンドウ
     (既定は tilda)が前面にあるときは、そのウィンドウ上でキーを取り、一覧をその内側に出す。
     ルートで取ったままだと、そちらが先に反応してしまうので、その間はルートでは取らない。
+    --yakuake-keep-open-key があれば、Yakuake が前面のときも Yakuake の上でキーを取り、
+    一覧を開いている間だけ Yakuake を引っ込まない設定にする(YakuakeKeepOpen)。
     """
 
     def __init__(self, args, bindings):
@@ -499,6 +671,10 @@ class Hotkeys:
             self.keys[parse_hotkey(spec, self.x)] = (spec, extra)
         self.grabbed = None  # キーを取っているウィンドウ
         self.embed = False
+        self.yakuake = YakuakeKeepOpen(self.x, args.yakuake_keep_open_key) if args.yakuake_keep_open_key else None
+        self.on_yakuake = False  # キーを取っているのが Yakuake のウィンドウか
+        self.picks = 0  # 起動して、まだ終わっていない pick の数
+        self.restore_to = None  # 一覧がすべて閉じたら、引っ込まない設定を戻す Yakuake のウィンドウ
         self.down = set()
         self.net_active = self.x.atom("_NET_ACTIVE_WINDOW")
         # キーを押し続けたときの自動リピートで、開閉を繰り返さないようにする
@@ -507,7 +683,9 @@ class Hotkeys:
         self.update_grab()
         GLib.io_add_watch(self.x.lib.XConnectionNumber(self.x.dpy), GLib.IO_IN, self.on_events)
         log("ショートカット: " + ", ".join(spec for spec, _ in self.keys.values())
-            + (f"(前面が {args.embed_class} のときは、その内側に表示)" if self.embed_classes else ""))
+            + (f"(前面が {args.embed_class} のときは、その内側に表示)" if self.embed_classes else "")
+            + (f"(前面が Yakuake のときは、{args.yakuake_keep_open_key} で引っ込まない設定に切り替える)"
+               if self.yakuake else ""))
 
     def grab(self, window, on):
         for (mask, keycode), (spec, _) in self.keys.items():
@@ -525,15 +703,21 @@ class Hotkeys:
 
     def update_grab(self):
         active = self.x.active_window()
-        embed = bool(active) and bool(self.embed_classes & set(self.x.wm_class(active)))
-        target = active if embed else self.x.root
+        classes = set(self.x.wm_class(active)) if active else set()
+        embed = bool(self.embed_classes & classes)
+        on_yakuake = self.yakuake is not None and "yakuake" in classes
+        if on_yakuake and not self.picks:
+            # 前回戻せなかった、引っ込まない設定を戻す
+            self.yakuake.restore(active)
+        target = active if embed or on_yakuake else self.x.root
         if target == self.grabbed:
             return
         if self.grabbed is not None:
             self.grab(self.grabbed, False)
         self.grab(target, True)
-        self.grabbed, self.embed = target, embed
-        debug(f"キーを取るウィンドウ: {target:#x}" + (" (内側に表示)" if embed else ""))
+        self.grabbed, self.embed, self.on_yakuake = target, embed, on_yakuake
+        debug(f"キーを取るウィンドウ: {target:#x}" + (" (内側に表示)" if embed else "")
+              + (" (Yakuake)" if on_yakuake else ""))
 
     def on_events(self, *_args):
         ev = ctypes.create_string_buffer(192)  # sizeof(XEvent)
@@ -562,9 +746,22 @@ class Hotkeys:
                 "--db", str(self.args.db)]
         if self.embed:
             argv += ["--embed", str(self.grabbed)]
+        if self.on_yakuake:
+            self.yakuake.before_pick()
+            self.restore_to = self.grabbed
         debug(f"起動: {argv}")
-        # 終わった子プロセスは GLib が片付ける
-        GLib.spawn_async(argv, flags=GLib.SpawnFlags.DEFAULT)
+        pid, *_ = GLib.spawn_async(argv, flags=GLib.SpawnFlags.DO_NOT_REAP_CHILD)
+        self.picks += 1
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, self.on_pick_exit)
+
+    def on_pick_exit(self, pid, _status):
+        GLib.spawn_close_pid(pid)
+        self.picks -= 1
+        # 一覧を開いたままもう一度キーを押すと、2 つ目の pick が 1 つ目を閉じる。どの pick が
+        # 最後に終わっても戻せるよう、すべて閉じた時点で戻す
+        if not self.picks and self.restore_to:
+            self.yakuake.restore(self.restore_to)
+            self.restore_to = None
 
 
 class Embedder:
@@ -1026,6 +1223,10 @@ def main():
     p.add_argument("--embed-class", default="tilda",
                    help="--hotkey を押したとき、前面がこの WM_CLASS のウィンドウなら、一覧をその内側に"
                         "出す。フォーカスを失うと隠れる端末のため。カンマ区切りで複数、空で無効 (既定: tilda)")
+    p.add_argument("--yakuake-keep-open-key", metavar="KEY",
+                   help="--hotkey を押したとき、前面が Yakuake なら、一覧を開いている間だけ Yakuake を"
+                        "「フォーカスを失っても引っ込まない」にする。Yakuake のその操作に割り当てたキー"
+                        "(例: Ctrl+Alt+Shift+K)を指定する")
     p.add_argument("--embed", type=lambda v: int(v, 0), help=argparse.SUPPRESS)  # 常駐プロセスが pick に渡す
     p.add_argument("-v", "--verbose", action="store_true", help="イベントごとの詳細ログを出す")
     args = p.parse_args()
